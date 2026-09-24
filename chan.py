@@ -298,95 +298,180 @@ def build_strokes(fractals, mdf: pd.DataFrame, min_k_between=3):
 
 
 # ================================================================
-# 4. 线段划分（简化版：特征序列分型法）
+# 4. 线段划分（特征序列分型法 —— 原文 P344-346 第 67 讲）
 # ================================================================
+def _merge_feature_inclusion(feats, direction):
+    """处理特征序列的包含关系。
+    feats: list of (lo, hi, stroke_idx)  —— 每个反向笔的价格区间
+    direction: 'up' 或 'down'（当前线段方向；决定包含合并的取舍）
+       - 上升线段：反向笔=下跌笔，特征序列上求"顶分型"（后续），包含时取高高、低高
+       - 下降线段：反向笔=上涨笔，特征序列上求"底分型"，包含时取低低、高低
+    返回：合并后的特征序列 list of (lo, hi, stroke_idx)
+    """
+    if not feats:
+        return []
+    merged = [feats[0]]
+    for lo, hi, si in feats[1:]:
+        p_lo, p_hi, p_si = merged[-1]
+        # 判断包含
+        contains_new = (p_lo <= lo and p_hi >= hi)   # 前包含新
+        contains_prev = (lo <= p_lo and hi >= p_hi)  # 新包含前
+        if contains_new or contains_prev:
+            if direction == 'up':
+                # 向上线段的特征序列：包含时取"最高高、最高低"（向上合并）
+                new_hi = max(p_hi, hi)
+                new_lo = max(p_lo, lo)
+            else:
+                new_hi = min(p_hi, hi)
+                new_lo = min(p_lo, lo)
+            merged[-1] = (new_lo, new_hi, si)  # 用较新那个的 stroke_idx
+        else:
+            merged.append((lo, hi, si))
+    return merged
+
+
 def build_segments(strokes):
     """
-    线段 = 至少 3 笔且方向一致的组合。
-    简化实现：以"特征序列"的顶底分型作为线段端点。
-      - 上涨线段的特征序列 = 所有向下的笔
-      - 下跌线段的特征序列 = 所有向上的笔
-    这里给出一个稳健的近似实现：
-      从第一笔开始尝试起线段，若后续同向笔创新高/低则延续，
-      当反向笔破坏了前一同向笔的极值且形成对应分型，视为线段终结。
+    线段划分 —— 特征序列分型法（原文 P344-346，第 67 讲）：
+      - 上升线段的特征序列 = 所有向下笔的区间 [end, start]（下笔）
+      - 下降线段的特征序列 = 所有向上笔的区间 [start, end]（上笔）
+      - 特征序列相邻元素若有包含关系 → 按线段方向合并
+      - 在特征序列上找顶/底分型（三元素）→ 线段结束
+        · 无缺口（元素 1-2 区间重叠）→ 直接在分型高/低点处结束
+        · 有缺口（元素 1-2 区间不重叠）→ 需要反向特征序列再出现相应分型才确认
+      - 至少 3 笔构成一段（原文 P340："被有重叠部分的连续三笔破坏"）
     """
     if len(strokes) < 3:
         return []
 
-    segments = []
-    i = 0
     n = len(strokes)
-    # 起始方向 = 第一笔方向
+    segments = []
+
+    # 用有限状态机在笔序列上滑动
     seg_dir = strokes[0]['direction']
-    seg_start_stroke = 0
-    seg_start_price = strokes[0]['start_price']
-    seg_end_stroke = 0
-    seg_extreme = strokes[0]['end_price']  # 目前线段末端极值
+    seg_start = 0                            # 线段起始笔索引
+    seg_extreme_stroke = 0                   # 目前触及极值的同向笔索引
+    seg_extreme_price = strokes[0]['end_price']
 
-    def extend(stroke, seg_dir, seg_extreme):
-        """同向笔是否延续线段极值"""
-        if stroke['direction'] != seg_dir:
-            return False, seg_extreme
-        if seg_dir == 'up' and stroke['end_price'] > seg_extreme:
-            return True, stroke['end_price']
-        if seg_dir == 'down' and stroke['end_price'] < seg_extreme:
-            return True, stroke['end_price']
-        return False, seg_extreme
-
+    # 待处理笔的游标
     k = 1
     while k < n:
-        s = strokes[k]
-        if s['direction'] == seg_dir:
-            ok, seg_extreme = extend(s, seg_dir, seg_extreme)
-            if ok:
-                seg_end_stroke = k
-            k += 1
-        else:
-            # 反向笔：判断是否终结线段
-            # 简化规则：连续两笔反向且第二反向笔的终点破坏了 seg_extreme 前的关键位
-            # 更稳的判定：反向笔的 end_price 是否越过前一同向笔的起点
-            # 即：上涨线段中，反向下笔的终点 < 上一上涨笔的起点 → 终结
-            reversed_end = s['end_price']
-            # 找上一同向笔
-            prev_same_start = None
-            for j in range(k-1, -1, -1):
-                if strokes[j]['direction'] == seg_dir:
-                    prev_same_start = strokes[j]['start_price']
-                    break
-            broken = False
-            if prev_same_start is not None:
-                if seg_dir == 'up' and reversed_end < prev_same_start:
-                    broken = True
-                if seg_dir == 'down' and reversed_end > prev_same_start:
-                    broken = True
+        # 特征序列 = 所有 [seg_start+1, k] 中方向与 seg_dir 相反 的笔
+        feats = []
+        for j in range(seg_start + 1, k + 1):
+            sj = strokes[j]
+            if sj['direction'] == seg_dir:
+                # 同向笔：更新极值
+                if seg_dir == 'up' and sj['end_price'] > seg_extreme_price:
+                    seg_extreme_price = sj['end_price']
+                    seg_extreme_stroke = j
+                elif seg_dir == 'down' and sj['end_price'] < seg_extreme_price:
+                    seg_extreme_price = sj['end_price']
+                    seg_extreme_stroke = j
+                continue
+            lo = min(sj['start_price'], sj['end_price'])
+            hi = max(sj['start_price'], sj['end_price'])
+            feats.append((lo, hi, j))
 
-            if broken and (seg_end_stroke - seg_start_stroke + 1) >= 3:
-                # 结束当前线段（终点 = 上一同向笔的终点，即 seg_extreme）
-                segments.append({
-                    'start_stroke': seg_start_stroke,
-                    'end_stroke': seg_end_stroke,
-                    'start_price': seg_start_price,
-                    'end_price': seg_extreme,
-                    'direction': seg_dir,
-                })
-                # 新线段从反向笔开始
-                seg_dir = s['direction']
-                seg_start_stroke = k
-                seg_start_price = s['start_price']
-                seg_end_stroke = k
-                seg_extreme = s['end_price']
-                k += 1
+        # 合并包含
+        merged = _merge_feature_inclusion(feats, seg_dir)
+
+        # 找特征序列分型（至少 3 个元素）
+        broken = False
+        confirm_at = None  # 分型确认的中间元素笔索引
+        seg_end_stroke = seg_extreme_stroke
+
+        if len(merged) >= 3:
+            # 只看最后 3 个元素，判断是否形成分型
+            e1, e2, e3 = merged[-3], merged[-2], merged[-1]
+            lo1, hi1, si1 = e1
+            lo2, hi2, si2 = e2
+            lo3, hi3, si3 = e3
+            if seg_dir == 'up':
+                # 顶分型：e2 的 hi 是最高，且 hi2 > hi1 且 hi2 > hi3
+                is_top = (hi2 > hi1 and hi2 > hi3 and lo2 > lo1 and lo2 > lo3)
+                if is_top:
+                    # 判断缺口：e1 与 e2 是否有重叠
+                    gap12 = (hi1 < lo2)  # 无重叠：hi1 < lo2 即为缺口
+                    if not gap12:
+                        # 无缺口：线段在 e2 之前（即 e2 之前的最后同向笔终点）结束
+                        # 端点 = 顶分型对应的极值笔
+                        broken = True
+                        confirm_at = si2  # 分型第 2 元素笔
+                    else:
+                        # 有缺口：需要反向序列再出现底分型才确认
+                        # 简化实现：从 e2 之后的笔开始，反向序列即"同向 seg_dir 的笔"
+                        # 找 si2 之后的 3 个 seg_dir 方向笔的底分型（下线段中的顶）
+                        rev_feats = []
+                        for j2 in range(si2 + 1, n):
+                            sj2 = strokes[j2]
+                            if sj2['direction'] != seg_dir:
+                                continue
+                            lo_ = min(sj2['start_price'], sj2['end_price'])
+                            hi_ = max(sj2['start_price'], sj2['end_price'])
+                            rev_feats.append((lo_, hi_, j2))
+                        rev_merged = _merge_feature_inclusion(rev_feats, 'down')
+                        if len(rev_merged) >= 3:
+                            r1, r2, r3 = rev_merged[-3], rev_merged[-2], rev_merged[-1]
+                            is_bot = (r2[0] < r1[0] and r2[0] < r3[0]
+                                      and r2[1] < r1[1] and r2[1] < r3[1])
+                            if is_bot:
+                                broken = True
+                                confirm_at = r2[2]
             else:
-                # 反向笔未终结线段（仅是同级别回撤，或不足 3 笔）
-                k += 1
+                # 下降线段：底分型
+                is_bot = (lo2 < lo1 and lo2 < lo3 and hi2 < hi1 and hi2 < hi3)
+                if is_bot:
+                    gap12 = (lo1 > hi2)
+                    if not gap12:
+                        broken = True
+                        confirm_at = si2
+                    else:
+                        rev_feats = []
+                        for j2 in range(si2 + 1, n):
+                            sj2 = strokes[j2]
+                            if sj2['direction'] != seg_dir:
+                                continue
+                            lo_ = min(sj2['start_price'], sj2['end_price'])
+                            hi_ = max(sj2['start_price'], sj2['end_price'])
+                            rev_feats.append((lo_, hi_, j2))
+                        rev_merged = _merge_feature_inclusion(rev_feats, 'up')
+                        if len(rev_merged) >= 3:
+                            r1, r2, r3 = rev_merged[-3], rev_merged[-2], rev_merged[-1]
+                            is_top = (r2[0] > r1[0] and r2[0] > r3[0]
+                                      and r2[1] > r1[1] and r2[1] > r3[1])
+                            if is_top:
+                                broken = True
+                                confirm_at = r2[2]
 
-    # 收尾：把最后一段收入（用于当下分析）
-    if seg_end_stroke > seg_start_stroke or (n - seg_start_stroke) >= 1:
+        if broken and (seg_extreme_stroke - seg_start + 1) >= 3:
+            # 结束当前线段
+            segments.append({
+                'start_stroke': seg_start,
+                'end_stroke': seg_extreme_stroke,
+                'start_price': strokes[seg_start]['start_price'],
+                'end_price': seg_extreme_price,
+                'direction': seg_dir,
+            })
+            # 新线段从极值笔的下一笔开始
+            new_start = seg_extreme_stroke + 1
+            if new_start >= n:
+                break
+            seg_dir = strokes[new_start]['direction']
+            seg_start = new_start
+            seg_extreme_stroke = new_start
+            seg_extreme_price = strokes[new_start]['end_price']
+            k = new_start + 1
+        else:
+            k += 1
+
+    # 收尾：最后一段（未确认破坏）也纳入，用于当下分析
+    if seg_start < n:
         segments.append({
-            'start_stroke': seg_start_stroke,
-            'end_stroke': seg_end_stroke,
-            'start_price': seg_start_price,
-            'end_price': seg_extreme,
+            'start_stroke': seg_start,
+            'end_stroke': seg_extreme_stroke,
+            'start_price': strokes[seg_start]['start_price'],
+            'end_price': seg_extreme_price,
             'direction': seg_dir,
         })
     return segments
@@ -430,22 +515,28 @@ def build_pivots(strokes):
         start_stroke = i
         end_stroke = i + 2
         highs = [hA, hB, hC]; lows = [lA, lB, lC]
-        # 延伸：只要后续笔与 [ZD,ZG] 有交集 就算中枢内
-        # 但若某笔的终点已跌破 ZD 或涨破 ZG，视为"离开笔"，不再纳入中枢
+        # 中枢延伸判据（缠论 P77 定理一 + P82 第三类买卖点定义）：
+        # 原文 Zn 是"与中枢方向一致的次级别走势段"，其区间 [dn,gn] 与 [ZD,ZG]
+        # 有重叠即延伸。实操上等价于：中枢震荡里"回试段"（反向笔）的终点若不
+        # 破 [ZD,ZG]，则震荡继续；一旦某笔终点破位（ep<ZD 或 ep>ZG）→ 该笔
+        # 即"离开笔"，中枢结束（否则等到形成三买/三卖也不合直觉：破位那一
+        # 刻就应该终结当前中枢，把破位后的走势交给"新生/扩展"判定）。
+        # 这样避免把明显破位后再反抽的行情（如恒科 6/22 深度下探）也被吞
+        # 进一个大中枢，从而丢失趋势背驰一买。
         j = i + 3
         while j < n:
             sj = strokes[j]
             ep = sj['end_price']
-            # 关键：若该笔终点已经离开中枢上下沿，则该笔是"离开笔"，中枢已结束
+            # 关键：笔终点已离开中枢上下沿 → 视为离开笔，中枢结束
             if ep < ZD or ep > ZG:
                 break
             lj, hj = rng(sj)
-            if hj >= ZD and lj <= ZG:
-                end_stroke = j
-                highs.append(hj); lows.append(lj)
-                j += 1
-            else:
+            # 二次保险：即便终点在区间内，笔的整体区间也必须与 [ZD,ZG] 有重叠
+            if hj < ZD or lj > ZG:
                 break
+            end_stroke = j
+            highs.append(hj); lows.append(lj)
+            j += 1
         pivots.append({
             'start_stroke': start_stroke,
             'end_stroke': end_stroke,
@@ -456,6 +547,33 @@ def build_pivots(strokes):
             'enter_direction': strokes[i-1]['direction'],
         })
         i = end_stroke + 1
+    classify_pivot_relations(pivots)
+    return pivots
+
+
+def classify_pivot_relations(pivots):
+    """根据缠论 P77-78 & 定理二判定相邻中枢关系（原地写入 pv['relation']）：
+      - 'new'       新生：两中枢 [ZD,ZG] 无重叠，且波动区间 [DD,GG] 也无重叠
+      - 'expansion' 扩展：两中枢 [ZD,ZG] 无重叠，但波动区间 [DD,GG] 有重叠
+                    （对应原文定理二第三条：后 ZG<前 ZD 且后 GG>=前 DD → 高级别中枢）
+      - 'extension' 延伸：两中枢 [ZD,ZG] 有重叠（同一中枢的自然延伸）
+    第一个中枢标为 'first'。
+    """
+    for pi, pv in enumerate(pivots):
+        if pi == 0:
+            pv['relation'] = 'first'
+            continue
+        prev = pivots[pi-1]
+        # 中枢区间重叠？
+        overlap_z = not (pv['ZD'] > prev['ZG'] or pv['ZG'] < prev['ZD'])
+        # 波动区间重叠？
+        overlap_gg = not (pv['DD'] > prev['GG'] or pv['GG'] < prev['DD'])
+        if overlap_z:
+            pv['relation'] = 'extension'
+        elif overlap_gg:
+            pv['relation'] = 'expansion'
+        else:
+            pv['relation'] = 'new'
     return pivots
 
 
@@ -607,7 +725,26 @@ def find_buy_sell_points(strokes, pivots, mdf: pd.DataFrame, orig_df: pd.DataFra
 
     # ================================================================
     # 一买 / 一卖：MACD 面积背驰（放宽版）
+    # 缠论 C.9：区分盘整背驰(中枢内 A/C) vs 趋势背驰(相邻两同向中枢的 A/C)
+    #   → 建立 stroke → pivot 映射，用于判断当前背驰跨不跨中枢
     # ================================================================
+    # 构建 stroke_idx → pivot_idx 映射
+    stroke2pivot = {}
+    for pi, pv in enumerate(pivots):
+        for si in range(pv['start_stroke'], pv['end_stroke'] + 1):
+            stroke2pivot.setdefault(si, pi)  # 若一笔跨多个中枢，取第一个（早）
+
+    def _classify_backchi(a_stroke_i, c_stroke_i):
+        """返回 '盘整' 或 '趋势'。
+        - 同一中枢内 → 盘整
+        - 不同中枢 or 未在中枢内 → 趋势（比较保守：既然 a/c 已跨中枢，视为趋势）
+        """
+        pa = stroke2pivot.get(a_stroke_i)
+        pc = stroke2pivot.get(c_stroke_i)
+        if pa is not None and pc is not None and pa == pc:
+            return '盘整'
+        return '趋势'
+
     for i in range(2, len(strokes)):
         a = strokes[i-2]; c = strokes[i]
         if a['direction'] != c['direction']:
@@ -617,29 +754,51 @@ def find_buy_sell_points(strokes, pivots, mdf: pd.DataFrame, orig_df: pd.DataFra
         pa_pos, pa_neg = macd_area(macdh, a0, a1)
         pc_pos, pc_neg = macd_area(macdh, c0, c1)
         macd_valid = (pa_pos + pa_neg) > 5 and (pc_pos + pc_neg) > 5
+        kind = _classify_backchi(i-2, i)
 
         if c['direction'] == 'down':
+            # 原文 P25/P30：第二次下跌"不必创新低"，只要 MACD 力度衰减即为背驰
+            #   严格背驰：c.end < a.end（创新低 + 面积缩小）
+            #   宽松背驰(W 底)：c.end 未大幅低于 a.end 但也未大幅高于（在 a.end ± 3% 内）
+            #                   + MACD 面积明显缩小（<= a * 0.6，更严格避免误报）
             new_low = c['end_price'] < a['end_price']
-            # 缠论核心：MACD 负面积缩小 = 背驰
+            near_low = (c['end_price'] <= a['end_price'] * 1.03  # 距离 a 低点不超过 3%
+                        and c['end_price'] >= a['end_price'] * 0.90)  # 也不能低太多（那样是新低场景）
             if new_low and macd_valid and pc_neg < pa_neg * 0.95:
                 dedup_append(buys, {
                     'type': '1B', 'idx': c['end_idx'],
                     'price': c['end_price'],
-                    'note': f'底背驰(MACD面积 {pc_neg:.0f}<{pa_neg:.0f})',
+                    'note': f'{kind}背驰底(MACD面积 {pc_neg:.0f}<{pa_neg:.0f})',
+                    'stroke_i': i,
+                })
+            elif near_low and macd_valid and pc_neg < pa_neg * 0.6 and pa_neg > 20:
+                dedup_append(buys, {
+                    'type': '1B', 'idx': c['end_idx'],
+                    'price': c['end_price'],
+                    'note': f'{kind}背驰底(W底 面积 {pc_neg:.0f}<<{pa_neg:.0f})',
                     'stroke_i': i,
                 })
         else:
             new_high = c['end_price'] > a['end_price']
+            near_high = (c['end_price'] >= a['end_price'] * 0.97
+                         and c['end_price'] <= a['end_price'] * 1.10)
             if new_high and macd_valid and pc_pos < pa_pos * 0.95:
                 dedup_append(sells, {
                     'type': '1S', 'idx': c['end_idx'],
                     'price': c['end_price'],
-                    'note': f'顶背驰(MACD面积 {pc_pos:.0f}<{pa_pos:.0f})',
+                    'note': f'{kind}背驰顶(MACD面积 {pc_pos:.0f}<{pa_pos:.0f})',
+                    'stroke_i': i,
+                })
+            elif near_high and macd_valid and pc_pos < pa_pos * 0.6 and pa_pos > 20:
+                dedup_append(sells, {
+                    'type': '1S', 'idx': c['end_idx'],
+                    'price': c['end_price'],
+                    'note': f'{kind}背驰顶(M头 面积 {pc_pos:.0f}<<{pa_pos:.0f})',
                     'stroke_i': i,
                 })
 
     # ================================================================
-    # 一买 / 一卖：盘整背驰（中枢内 A 与 C 段比较）
+    # 一买 / 一卖：盘整背驰（中枢内 A 段 与 中枢的同向"离开笔" C 段 比较）
     # ================================================================
     for pv in pivots:
         s0 = pv['start_stroke']    # A
@@ -657,7 +816,7 @@ def find_buy_sell_points(strokes, pivots, mdf: pd.DataFrame, orig_df: pd.DataFra
                     dedup_append(buys, {
                         'type': '1B', 'idx': end_s['end_idx'],
                         'price': end_s['end_price'],
-                        'note': f'中枢盘整底背驰(面积 {pc_neg:.0f}<{pa_neg:.0f})',
+                        'note': f'盘整背驰底(中枢内 面积 {pc_neg:.0f}<{pa_neg:.0f})',
                         'stroke_i': s2,
                     })
             else:
@@ -665,21 +824,131 @@ def find_buy_sell_points(strokes, pivots, mdf: pd.DataFrame, orig_df: pd.DataFra
                     dedup_append(sells, {
                         'type': '1S', 'idx': end_s['end_idx'],
                         'price': end_s['end_price'],
-                        'note': f'中枢盘整顶背驰(面积 {pc_pos:.0f}<{pa_pos:.0f})',
+                        'note': f'盘整背驰顶(中枢内 面积 {pc_pos:.0f}<{pa_pos:.0f})',
                         'stroke_i': s2,
                     })
 
     # ================================================================
-    # 二买 / 二卖：一买后第一个反向笔终点不破一买价
-    # 缠论20讲原文定义：只需 1 段反向，不要求 "上涨-下跌" 两段
-    # 
-    # 加强版：
-    #   规则A (标准)：1B 后的 up-down 两段，第二段 down 终点 > 1B 价 → 2B
-    #   规则B (对称买回)：1S 后紧接的第一段 down 终点 → 2B 候选（顶背驰后的回撤买回）
-    #                     1B 后紧接的第一段 up 终点   → 2S 候选（底背驰后的反弹止盈）
+    # 一买 / 一卖：趋势背驰（相邻两同向中枢：前中枢"进入 A" 与 后中枢"离开 C" 比较）
+    # 原文 P105-106：趋势背驰 → 保证跌回前中枢，力度确定，一买/一卖成立
+    # ================================================================
+    for pi in range(1, len(pivots)):
+        pv_prev, pv_curr = pivots[pi-1], pivots[pi]
+        # 前中枢的方向可以看 A（start_stroke）的方向；两中枢同向定义为：
+        #   前后两个中枢的"离开笔"方向相同（都下 → 下跌趋势；都上 → 上涨趋势）
+        end_prev = strokes[pv_prev['end_stroke']]
+        end_curr = strokes[pv_curr['end_stroke']]
+        A_prev = strokes[pv_prev['start_stroke']]
+        A_curr = strokes[pv_curr['start_stroke']]
+        # 只有前后中枢的"起始笔 A"方向都相同（都是往同一方向进入的），才是同向趋势
+        if A_prev['direction'] != A_curr['direction']:
+            continue
+        dirn = A_prev['direction']
+        # 中枢关系需满足"下移 or 上移"（后中枢整体在前中枢的对应方向侧）
+        if dirn == 'down':
+            if not (pv_curr['ZG'] < pv_prev['ZG'] and pv_curr['ZD'] < pv_prev['ZD']):
+                continue
+        else:
+            if not (pv_curr['ZG'] > pv_prev['ZG'] and pv_curr['ZD'] > pv_prev['ZD']):
+                continue
+        # A = 前中枢的 start 段，C = 后中枢的 end 段（若方向不同则跳过）
+        if end_curr['direction'] != dirn:
+            continue
+        a0, a1 = orig_idx_map[A_prev['start_idx']], orig_idx_map[A_prev['end_idx']]
+        c0, c1 = orig_idx_map[end_curr['start_idx']], orig_idx_map[end_curr['end_idx']]
+        pa_pos, pa_neg = macd_area(macdh, a0, a1)
+        pc_pos, pc_neg = macd_area(macdh, c0, c1)
+        if dirn == 'down':
+            if end_curr['end_price'] < A_prev['end_price'] and pa_neg > 5 and pc_neg < pa_neg * 0.95:
+                dedup_append(buys, {
+                    'type': '1B', 'idx': end_curr['end_idx'],
+                    'price': end_curr['end_price'],
+                    'note': f'趋势背驰底(跨中枢 面积 {pc_neg:.0f}<{pa_neg:.0f})',
+                    'stroke_i': pv_curr['end_stroke'],
+                })
+        else:
+            if end_curr['end_price'] > A_prev['end_price'] and pa_pos > 5 and pc_pos < pa_pos * 0.95:
+                dedup_append(sells, {
+                    'type': '1S', 'idx': end_curr['end_idx'],
+                    'price': end_curr['end_price'],
+                    'note': f'趋势背驰顶(跨中枢 面积 {pc_pos:.0f}<{pa_pos:.0f})',
+                    'stroke_i': pv_curr['end_stroke'],
+                })
+
+    # ================================================================
+    # 一买 / 一卖：跨中枢新低/新高背驰（补漏）
+    # 场景：只形成了 1 个中枢，随后一笔离开中枢向下（or 向上）创出全局新低（or 新高）；
+    #      与中枢**进入段**（enter_stroke，方向和离开段同向）的 MACD 面积比较缩小 → 1B/1S
+    # 原文依据：P105-106 趋势背驰的一般化——只要"离开中枢的这一笔"相对"进入中枢的
+    #          那一笔（同为主趋势方向）"力度衰减且创新极值即成立；不必等到形成两个中枢。
+    # 这补的是上面 811 行"两中枢比较"要求太严的情况：HK.800700 08-12→09-11 类
+    # 破位下跌只有 1 个可参照中枢，走不到 811 分支，但方向与力度都是标准趋势背驰。
+    # ================================================================
+    for pv in pivots:
+        enter_idx = pv.get('enter_stroke', pv['start_stroke'] - 1)
+        if enter_idx < 0 or enter_idx >= len(strokes):
+            continue
+        enter_s = strokes[enter_idx]
+        dirn = enter_s['direction']
+        # 中枢结束后，扫描后续同向笔序列，找**创新极值**且**跨越 ZD/ZG**的最远那一笔
+        # 这样即使离开中枢后被拆成 上→下→上→下 多段，也能正确定位到"最深"那笔作为 C
+        best_leave_i = None
+        best_price = None
+        j = pv['end_stroke'] + 1
+        # 只在离开后未形成新中枢前扫描（走到 pivots 里下一个 pivot 开始为止）
+        j_stop = len(strokes)
+        # 找下一个 pivot 的起点作为扫描边界，避免跟"两中枢比较"分支重复
+        for pv2 in pivots:
+            if pv2['start_stroke'] > pv['end_stroke']:
+                j_stop = min(j_stop, pv2['start_stroke'])
+                break
+        while j < j_stop:
+            sj = strokes[j]
+            if sj['direction'] == dirn:
+                if dirn == 'down':
+                    if sj['end_price'] < pv['ZD']:
+                        if best_price is None or sj['end_price'] < best_price:
+                            best_price = sj['end_price']
+                            best_leave_i = j
+                else:
+                    if sj['end_price'] > pv['ZG']:
+                        if best_price is None or sj['end_price'] > best_price:
+                            best_price = sj['end_price']
+                            best_leave_i = j
+            j += 1
+        if best_leave_i is None:
+            continue
+        leave_s = strokes[best_leave_i]
+        a0, a1 = orig_idx_map[enter_s['start_idx']], orig_idx_map[enter_s['end_idx']]
+        c0, c1 = orig_idx_map[leave_s['start_idx']], orig_idx_map[leave_s['end_idx']]
+        pa_pos, pa_neg = macd_area(macdh, a0, a1)
+        pc_pos, pc_neg = macd_area(macdh, c0, c1)
+        if dirn == 'down':
+            new_low = leave_s['end_price'] < enter_s['end_price']
+            if new_low and pa_neg > 5 and pc_neg < pa_neg * 0.95:
+                dedup_append(buys, {
+                    'type': '1B', 'idx': leave_s['end_idx'],
+                    'price': leave_s['end_price'],
+                    'note': f'趋势背驰底(离开中枢[{pv["ZD"]:.0f},{pv["ZG"]:.0f}] 面积 {pc_neg:.0f}<{pa_neg:.0f})',
+                    'stroke_i': best_leave_i,
+                })
+        else:
+            new_high = leave_s['end_price'] > enter_s['end_price']
+            if new_high and pa_pos > 5 and pc_pos < pa_pos * 0.95:
+                dedup_append(sells, {
+                    'type': '1S', 'idx': leave_s['end_idx'],
+                    'price': leave_s['end_price'],
+                    'note': f'趋势背驰顶(离开中枢[{pv["ZD"]:.0f},{pv["ZG"]:.0f}] 面积 {pc_pos:.0f}<{pa_pos:.0f})',
+                    'stroke_i': best_leave_i,
+                })
+
+    # ================================================================
+    # 二买 / 二卖：严格按缠论 P91 原文
+    #   一买 → 次级上涨笔 → 次级下跌笔，下笔终点 > 1B 价 → 正式 2B
+    #                                     下笔终点 < 1B 价 → 降级 2B?
+    #   卖点对称。（原"对称买回/止盈"分支属波浪理论做法，已删除。）
     # ================================================================
     def add_second_points():
-        # 规则 A：标准二买
         base_1B = [b for b in buys if b['type'] == '1B']
         for b in base_1B:
             si = b['stroke_i']
@@ -690,11 +959,20 @@ def find_buy_sell_points(strokes, pivots, mdf: pd.DataFrame, orig_df: pd.DataFra
                 continue
             if si + 2 < len(strokes):
                 down_stroke = strokes[si + 2]
-                if down_stroke['direction'] == 'down' and down_stroke['end_price'] > b['price']:
+                if down_stroke['direction'] != 'down':
+                    continue
+                if down_stroke['end_price'] > b['price']:
                     dedup_append(buys, {
                         'type': '2B', 'idx': down_stroke['end_idx'],
                         'price': down_stroke['end_price'],
                         'note': f'一买后回抽不破 1B({b["price"]:.0f})',
+                        'stroke_i': si + 2,
+                    })
+                else:
+                    dedup_append(buys, {
+                        'type': '2B?', 'idx': down_stroke['end_idx'],
+                        'price': down_stroke['end_price'],
+                        'note': f'一买后回抽已破 1B({b["price"]:.0f})，降级观察',
                         'stroke_i': si + 2,
                     })
         base_1S = [s for s in sells if s['type'] == '1S']
@@ -707,39 +985,22 @@ def find_buy_sell_points(strokes, pivots, mdf: pd.DataFrame, orig_df: pd.DataFra
                 continue
             if si + 2 < len(strokes):
                 up_stroke = strokes[si + 2]
-                if up_stroke['direction'] == 'up' and up_stroke['end_price'] < s['price']:
+                if up_stroke['direction'] != 'up':
+                    continue
+                if up_stroke['end_price'] < s['price']:
                     dedup_append(sells, {
                         'type': '2S', 'idx': up_stroke['end_idx'],
                         'price': up_stroke['end_price'],
                         'note': f'一卖后反抽不破 1S({s["price"]:.0f})',
                         'stroke_i': si + 2,
                     })
-        # 规则 B：顶背驰后紧接的第一段下跌终点 = 二买（对称买回）
-        for s in base_1S:
-            si = s['stroke_i']
-            if si + 1 >= len(strokes):
-                continue
-            nxt = strokes[si + 1]
-            if nxt['direction'] == 'down':
-                dedup_append(buys, {
-                    'type': '2B', 'idx': nxt['end_idx'],
-                    'price': nxt['end_price'],
-                    'note': f'一卖后回撤到位（对称买回）',
-                    'stroke_i': si + 1,
-                })
-        # 底背驰后紧接的第一段上涨终点 = 二卖（对称止盈）
-        for b in base_1B:
-            si = b['stroke_i']
-            if si + 1 >= len(strokes):
-                continue
-            nxt = strokes[si + 1]
-            if nxt['direction'] == 'up':
-                dedup_append(sells, {
-                    'type': '2S', 'idx': nxt['end_idx'],
-                    'price': nxt['end_price'],
-                    'note': f'一买后反弹到位（对称止盈）',
-                    'stroke_i': si + 1,
-                })
+                else:
+                    dedup_append(sells, {
+                        'type': '2S?', 'idx': up_stroke['end_idx'],
+                        'price': up_stroke['end_price'],
+                        'note': f'一卖后反抽已破 1S({s["price"]:.0f})，降级观察',
+                        'stroke_i': si + 2,
+                    })
     add_second_points()
 
     # ================================================================
@@ -951,6 +1212,182 @@ def find_buy_sell_points(strokes, pivots, mdf: pd.DataFrame, orig_df: pd.DataFra
     return buys, sells
 
 
+# ================================================================
+# 7. 单个买卖点的详细解释（配合"最近 N 个信号"图上说明）
+# ================================================================
+_TYPE_DEFS = {
+    '1B': ('一类买点 1B',
+           '缠论原文 教你炒股票 20/24-25：下跌走势的最后一段出现"力度衰减"（MACD 面积缩小 / 或 W 底型面积大幅收敛），构成底背驰 → 一买。'),
+    '2B': ('二类买点 2B',
+           '缠论原文 教你炒股票 20-21：一买之后第一次向上、随后回抽的低点未跌破 1B 低点 → 二买。'),
+    '3B': ('三类买点 3B',
+           '缠论原文 教你炒股票 20（第三类买卖点定理）：一段次级别向上离开中枢后，回抽笔的低点不再跌回中枢 ZG 之下 → 三买。'),
+    '1S': ('一类卖点 1S',
+           '缠论原文 教你炒股票 20/24-25：上涨走势的最后一段出现"力度衰减"，构成顶背驰 → 一卖。'),
+    '2S': ('二类卖点 2S',
+           '缠论原文 教你炒股票 20-21：一卖之后第一次向下、随后反抽的高点未升破 1S 高点 → 二卖。'),
+    '3S': ('三类卖点 3S',
+           '缠论原文 教你炒股票 20（第三类买卖点定理）：一段次级别向下离开中枢后，反抽笔的高点不再升回中枢 ZD 之上 → 三卖。'),
+}
+
+
+def _find_related_pivot(sig, strokes, pivots):
+    """找信号最相关的中枢：优先取信号发生笔所在或紧邻的中枢。"""
+    si = sig.get('stroke_i', -1)
+    if si < 0 or not pivots:
+        return None
+    # 1) 信号笔在某个中枢范围内
+    for pv in pivots:
+        if pv['start_stroke'] <= si <= pv['end_stroke']:
+            return pv
+    # 2) 信号笔是某中枢的离开笔（end_stroke+1）
+    for pv in pivots:
+        if pv['end_stroke'] + 1 == si:
+            return pv
+    # 3) 信号笔之前最近的中枢
+    prev = None
+    for pv in pivots:
+        if pv['end_stroke'] < si:
+            prev = pv
+    return prev
+
+
+def _collect_same_bar_signals(sig, buys, sells):
+    """
+    找到与 sig 位于同一根 K 线（相同 idx）的其他信号。
+    用于识别"3S 与 1B? 同位置"这种缠论"卖买同源、级别不同"场景。
+    返回 list[dict]（不含 sig 自己）。
+    """
+    same = []
+    for other in list(buys) + list(sells):
+        if other is sig:
+            continue
+        if other.get('idx') == sig.get('idx'):
+            same.append(other)
+    return same
+
+
+def _level_note_for_conflict(sig, same_bar):
+    """
+    缠论《教你炒股票 20/24/72》：同一位置同时出现 3S 与 1B（或 3B 与 1S）
+    并不冲突——3 类信号看的是本级别中枢结构，1 类信号看的是次级别力度衰减。
+    操作上：本级别正式信号优先，潜在的 1 类做"次级别观察"处理。
+
+    根据 sig 与 same_bar 的组合返回一句级别提示。
+    覆盖四种"卖买同源"组合（含正式/潜在的排列）：
+      本身是 1B（含 1B?），同位置有 3S/3S?
+      本身是 1S（含 1S?），同位置有 3B/3B?
+      本身是 3S（含 3S?），同位置有 1B/1B?
+      本身是 3B（含 3B?），同位置有 1S/1S?
+    """
+    if not same_bar:
+        return ''
+    base = sig['type'].rstrip('?')
+    other_bases = {o['type'].rstrip('?') for o in same_bar}
+
+    # 场景 A：本身是 1B（含 1B?），同位置有 3S 家族 → 次级别观察位
+    if base == '1B' and '3S' in other_bases:
+        return ('[级别] 本级别看这是 3S（中枢破位、新一段下跌开启）；此处 1B 只可能是'
+                '次级别（如 60min）观察位，日线 1B 需待本段下跌走完并出现日线背驰后成立。')
+    # 场景 B：本身是 1S（含 1S?），同位置有 3B 家族 → 对称
+    if base == '1S' and '3B' in other_bases:
+        return ('[级别] 本级别看这是 3B（中枢突破、新一段上涨开启）；此处 1S 只可能是'
+                '次级别（如 60min）观察位，日线 1S 需待本段上涨走完并出现日线背驰后成立。')
+    # 场景 C：本身是 3S（含 3S?），同位置有 1B 家族 → 主动说明"卖买同源"
+    if base == '3S' and '1B' in other_bases:
+        return ('[级别] 原文"卖买同源"：本级别 3S 成立的同时，次级别 1B 候选可能已出现。'
+                '操作次序：先按 3S 离场，空仓等次级别 1B 落地再进。')
+    if base == '3B' and '1S' in other_bases:
+        return ('[级别] 原文"卖买同源"：本级别 3B 成立的同时，次级别 1S 候选可能已出现。'
+                '操作次序：先按 3B 进场，遇次级别 1S 减仓，日线 1S 才是主离场。')
+    return ''
+
+
+def explain_signal(sig, mdf, strokes, pivots, all_buys=None, all_sells=None):
+    """
+    为单个买卖点生成 2-4 行详细解释。
+    每行不超过 42 字符，便于渲染在图上说明框内。
+    返回 list[str]，第一行是标题（含日期/类型/价格），之后是解释。
+
+    all_buys / all_sells: 用于检测"同一根 K 同时出现多个信号"的级别冲突场景；
+                          缺省则不做级别标注。
+    """
+    base_type = sig['type'].rstrip('?')  # '1B?' → '1B'
+    is_pending = sig['type'].endswith('?')
+    typ_name, typ_def = _TYPE_DEFS.get(base_type, (sig['type'], ''))
+    dt = _fmt_ts(mdf['time_key'].iloc[sig['idx']], style='full')
+
+    lines = []
+    # 首行：日期 类型 价格
+    tag = '（潜在观察）' if is_pending else ''
+    lines.append(f'· {dt}  {typ_name}{tag}  @ {sig["price"]:.2f}')
+
+    # 第二行：原文定义（精简版）
+    lines.append(f'  [定义] {typ_def}')
+
+    # 第三行起：本次触发的具体理由（用 note + 关联中枢/笔的量化数据）
+    reason_bits = [sig.get('note', '')]
+
+    pv = _find_related_pivot(sig, strokes, pivots)
+    si = sig.get('stroke_i', -1)
+    if 0 <= si < len(strokes):
+        s_now = strokes[si]
+        t0 = _fmt_ts(mdf['time_key'].iloc[s_now['start_idx']], style='short')
+        t1 = _fmt_ts(mdf['time_key'].iloc[s_now['end_idx']], style='short')
+        dir_zh = '涨' if s_now['direction'] == 'up' else '跌'
+        reason_bits.append(
+            f'触发笔: {t0}({s_now["start_price"]:.0f})→{t1}({s_now["end_price"]:.0f}) {dir_zh}'
+        )
+
+    if pv is not None:
+        reason_bits.append(
+            f'关联中枢: [{pv["ZD"]:.0f}, {pv["ZG"]:.0f}]'
+        )
+
+    # 三类买卖点补一句"位置关系"
+    if base_type == '3B' and pv is not None:
+        reason_bits.append(f'回抽低点 {sig["price"]:.0f} > 中枢上沿 ZG={pv["ZG"]:.0f} → 中枢已被有效突破')
+    elif base_type == '3S' and pv is not None:
+        reason_bits.append(f'反抽高点 {sig["price"]:.0f} < 中枢下沿 ZD={pv["ZD"]:.0f} → 中枢已被有效跌破')
+
+    for bit in reason_bits:
+        if bit:
+            lines.append(f'  [依据] {bit}')
+
+    # 级别标注：同一位置同时出现 3S/3B 与 1B?/1S? 时按原文"卖买同源、级别不同"提示
+    if all_buys is not None and all_sells is not None:
+        same_bar = _collect_same_bar_signals(sig, all_buys, all_sells)
+        level_note = _level_note_for_conflict(sig, same_bar)
+        if level_note:
+            lines.append(f'  {level_note}')
+
+    return lines
+
+
+def format_recent_signals_block(buys, sells, mdf, strokes, pivots, n=5,
+                                include_pending=True):
+    """
+    从 buys+sells 里按时间倒序取最近 n 个信号，输出每个的详细解释块。
+    include_pending: 是否包含 '1B?'/'2B?'/'3B?' 这类潜在信号。
+    """
+    all_sigs = list(buys) + list(sells)
+    if not include_pending:
+        all_sigs = [s for s in all_sigs if not s['type'].endswith('?')]
+    if not all_sigs:
+        return [f'【最近 {n} 个买卖点分析】', '  暂无信号']
+    all_sigs.sort(key=lambda s: s['idx'], reverse=True)
+    recent = all_sigs[:n]
+    recent = list(reversed(recent))  # 时间正序输出（早→晚）
+
+    out = [f'【最近 {len(recent)} 个买卖点分析（按时间正序）】']
+    for i, sig in enumerate(recent, 1):
+        out.append(f'{i}.')
+        # 传入全量 buys/sells 以便检测同位置级别冲突
+        out.extend(explain_signal(sig, mdf, strokes, pivots,
+                                  all_buys=buys, all_sells=sells))
+    return out
+
+
 def interpret_market(orig_df, mdf, strokes, pivots, buys, sells):
     """
     基于《缠中说禅》原文（教你炒股票 17-25、63-84）生成当下走势解读文本。
@@ -1022,6 +1459,17 @@ def interpret_market(orig_df, mdf, strokes, pivots, buys, sells):
             piv_range = ''
 
         lines.append(f'· 最新中枢: [{zd:.0f}, {zg:.0f}] {piv_range}')
+        # 中枢关系（新生/扩展/延伸）—— 缠论 P77-78 B.4
+        rel = last_pivot.get('relation', 'first')
+        if rel != 'first' and len(pivots) >= 2:
+            prev_pv = pivots[-2]
+            rel_zh = {'new': '新生（与前中枢完全不重叠）',
+                      'expansion': '扩展（波动区间触及前中枢，形成高级别中枢）',
+                      'extension': '延伸（与前中枢区间重叠，同级别震荡）'}.get(rel, rel)
+            lines.append(
+                f'· 中枢关系: {rel_zh}   前中枢[{prev_pv["ZD"]:.0f},{prev_pv["ZG"]:.0f}]'
+                f' GG={prev_pv["GG"]:.0f} DD={prev_pv["DD"]:.0f}'
+            )
 
         # 三态：破上 / 破下 / 中枢内
         if last_close > zg:
@@ -1092,12 +1540,21 @@ def interpret_market(orig_df, mdf, strokes, pivots, buys, sells):
 # ================================================================
 def plot_chan(orig_df, mdf, fractals, strokes, segments, pivots, buys, sells,
               sub_strokes=None, display_start=None,
-              title='恒生科技指数 HK.800700  缠论分析'):
+              title='恒生科技指数 HK.800700  缠论分析',
+              n_recent_signals=5, recent_only_formal=False,
+              show_fractals=True):
     """
     display_start: pd.Timestamp 或 None
       若非 None，则只在 x 轴上显示 time_key >= display_start 的部分（预热段留给
       指标计算，不进入可视区域）。所有分型/笔/中枢/买卖点仍是基于全量数据计算，
       只有 x 轴 xlim 被裁剪。
+
+    n_recent_signals: int，默认 5
+      在图右下方显示最近 N 个买卖点的详细解释（含原文定义与本次触发依据）。
+      设为 0 时不显示。
+
+    recent_only_formal: bool
+      True 时只展示正式买卖点（1B/2B/3B/1S/2S/3S），不含 1B?/2B?/1S?/2S? 等潜在点。
     """
     fig = plt.figure(figsize=(22, 11))
     gs = fig.add_gridspec(3, 1, height_ratios=[3, 1, 0.05], hspace=0.08,
@@ -1133,14 +1590,15 @@ def plot_chan(orig_df, mdf, fractals, strokes, segments, pivots, buys, sells,
 
     # --- 分型（用合并后 mdf 的 orig_idx 映射回原始 x） ---
     orig_idx_map = mdf['orig_idx'].values
-    for fi, ftype, fp in fractals:
-        xi = orig_idx_map[fi]
-        if ftype == 'top':
-            ax.annotate('', xy=(xi, fp * 1.005), xytext=(xi, fp * 1.02),
-                        arrowprops=dict(arrowstyle='->', color='#e67e22', lw=1))
-        else:
-            ax.annotate('', xy=(xi, fp * 0.995), xytext=(xi, fp * 0.98),
-                        arrowprops=dict(arrowstyle='->', color='#3498db', lw=1))
+    if show_fractals:
+        for fi, ftype, fp in fractals:
+            xi = orig_idx_map[fi]
+            if ftype == 'top':
+                ax.annotate('', xy=(xi, fp * 1.005), xytext=(xi, fp * 1.02),
+                            arrowprops=dict(arrowstyle='->', color='#e67e22', lw=1))
+            else:
+                ax.annotate('', xy=(xi, fp * 0.995), xytext=(xi, fp * 0.98),
+                            arrowprops=dict(arrowstyle='->', color='#3498db', lw=1))
 
     # --- 笔 ---
     # 先画长笔的子笔（细线，次级别）
@@ -1216,7 +1674,32 @@ def plot_chan(orig_df, mdf, fractals, strokes, segments, pivots, buys, sells,
     # 潜在观察位透明度更低
     def _alpha(t):
         return 0.55 if t.endswith('?') else 1.0
+
+    # ---- 同位置信号去重（原文"卖买同源、级别不同"） ----
+    # 当同一根 K（相同 idx）上出现多个信号，图上只画"最主要"的那一个，
+    # 避免箭头堆叠遮挡；其余同位置信号仍在右侧说明框中出现并附带[级别]提示。
+    # 优先级：正式 > 潜在；3 类 > 1 类 > 2 类（3 类是本级别中枢结构判断，最强）。
+    _type_prio = {'3B': 0, '3S': 0, '1B': 1, '1S': 1, '2B': 2, '2S': 2}
+
+    def _sig_prio(sig):
+        base = sig['type'].rstrip('?')
+        pending_penalty = 10 if sig['type'].endswith('?') else 0
+        return _type_prio.get(base, 5) + pending_penalty
+
+    # 每个 idx 只保留优先级最高的那一个（数值越小越优先）
+    keep_by_idx = {}
+    for sig in list(buys) + list(sells):
+        idx = sig['idx']
+        p = _sig_prio(sig)
+        if idx not in keep_by_idx or p < keep_by_idx[idx][0]:
+            keep_by_idx[idx] = (p, id(sig))
+
+    def _plot_visible(sig):
+        return keep_by_idx.get(sig['idx'], (99, 0))[1] == id(sig)
+
     for b in buys:
+        if not _plot_visible(b):
+            continue
         xi = orig_idx_map[b['idx']]
         m, cc, sz = marker_map_buy[b['type']]
         a = _alpha(b['type'])
@@ -1227,6 +1710,8 @@ def plot_chan(orig_df, mdf, fractals, strokes, segments, pivots, buys, sells,
                     ha='center', fontsize=8, color=cc, fontweight='bold',
                     alpha=a)
     for s in sells:
+        if not _plot_visible(s):
+            continue
         xi = orig_idx_map[s['idx']]
         m, cc, sz = marker_map_sell[s['type']]
         a = _alpha(s['type'])
@@ -1243,11 +1728,29 @@ def plot_chan(orig_df, mdf, fractals, strokes, segments, pivots, buys, sells,
 
     # 当下走势解读（放到主图右侧图外，避免遮挡 K 线）
     interp_lines = interpret_market(orig_df, mdf, strokes, pivots, buys, sells)
-    text = '\n'.join(interp_lines)
-    fig.text(0.735, 0.94, text,
+    interp_text = '\n'.join(interp_lines)
+    # 上半：当下走势解读
+    fig.text(0.735, 0.94, interp_text,
              ha='left', va='top', fontsize=9,
              bbox=dict(boxstyle='round,pad=0.6', facecolor='#fffbe6',
                        edgecolor='#d4a017', alpha=0.95))
+
+    # 下半：最近 N 个买卖点分析
+    if n_recent_signals > 0:
+        # 估算走势解读占用的纵向空间：按每行约 0.017 fig 高度
+        interp_h = 0.017 * max(len(interp_lines), 5) + 0.02
+        y_top = 0.94 - interp_h - 0.015  # 与上半留一点空隙
+        recent_lines = format_recent_signals_block(
+            buys, sells, mdf, strokes, pivots,
+            n=n_recent_signals, include_pending=not recent_only_formal)
+        recent_text = '\n'.join(recent_lines)
+        # 若纵向不够，字号缩到 7.5
+        n_line = len(recent_lines)
+        fs = 8 if n_line <= 26 else 7 if n_line <= 34 else 6.2
+        fig.text(0.735, y_top, recent_text,
+                 ha='left', va='top', fontsize=fs,
+                 bbox=dict(boxstyle='round,pad=0.5', facecolor='#eefbf3',
+                           edgecolor='#27ae60', alpha=0.95))
 
     # 图例
     legend_elems = [
@@ -1332,10 +1835,10 @@ def main():
                         help='数据源：txt 从本地文件读，futu 走 OpenD 拉取')
     parser.add_argument('--txt', default='长文本-1790229713.txt',
                         help='本地 txt 数据文件路径（source=txt 时使用）')
-    parser.add_argument('--stock', default='HK.800700',
+    parser.add_argument('--stock', default='HK.00700',
                         help='股票/指数代码（source=futu 时使用）')
-    parser.add_argument('--start', default='2026-03-11')
-    parser.add_argument('--end',   default='2026-11-25')
+    parser.add_argument('--start', default='2026-02-01')
+    parser.add_argument('--end',   default='2026-09-25')
     parser.add_argument('--ktype',
                         choices=['K_DAY', 'K_60M', 'K_120M', 'K_240M',
                                  'K_WEEK', 'K_MON'],
@@ -1349,6 +1852,14 @@ def main():
     parser.add_argument('--display-start', default=None,
                         help='txt 数据源可选：只展示 >= 此日期的 K 线，之前作为预热段。'
                              '格式 YYYY-MM-DD。')
+    parser.add_argument('--recent-signals', type=int, default=10,
+                        help='在图右侧显示最近 N 个买卖点的详细解释（含原文定义与'
+                             '本次触发依据）。设 0 关闭。默认 5。')
+    parser.add_argument('--recent-only-formal', action='store_true',
+                        help='最近信号只显示正式买卖点（不含 1B?/2B?/1S?/2S? 等潜在点）。')
+    parser.add_argument('--hide-fractals', action='store_true',
+                        help='隐藏图上的顶/底分型箭头（橙色向下箭头=顶分型，蓝色向上箭头=底分型）。'
+                             '默认显示；仅影响绘图，不影响笔/线段/中枢/买卖点的计算。')
     args = parser.parse_args()
 
     display_start = None
@@ -1440,7 +1951,10 @@ def main():
             print(f"  笔{i}: {pts_str}")
     fig = plot_chan(orig_df, mdf, fractals, strokes, segments, pivots,
                     buys, sells, sub_strokes=sub_strokes,
-                    display_start=display_start, title=title)
+                    display_start=display_start, title=title,
+                    n_recent_signals=args.recent_signals,
+                    recent_only_formal=args.recent_only_formal,
+                    show_fractals=not args.hide_fractals)
     out_png = args.out
     fig.savefig(out_png, dpi=140, bbox_inches='tight')
     print(f"[保存] {out_png}")
