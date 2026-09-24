@@ -31,6 +31,7 @@ from matplotlib.lines import Line2D
 import matplotlib as mpl
 import re
 import os
+from datetime import timedelta
 
 # 中文字体
 for font in ['PingFang SC', 'Heiti SC', 'STHeiti', 'SimHei', 'Microsoft YaHei',
@@ -42,15 +43,43 @@ mpl.rcParams['axes.unicode_minus'] = False
 # ================================================================
 # 0. 数据读取
 # ================================================================
+def _fmt_ts(ts, style='short'):
+    """把 pandas Timestamp / datetime 按数据是否为日内自适应格式化。
+    style='short' → 日线:%m-%d, 日内:%m-%d %H:%M
+    style='full'  → 日线:%Y-%m-%d, 日内:%Y-%m-%d %H:%M
+    """
+    if not hasattr(ts, 'strftime'):
+        return str(ts)[:16]
+    intraday = ts.hour != 0 or ts.minute != 0
+    if style == 'full':
+        return ts.strftime('%Y-%m-%d %H:%M') if intraday else ts.strftime('%Y-%m-%d')
+    return ts.strftime('%m-%d %H:%M') if intraday else ts.strftime('%m-%d')
+
+
 def load_from_txt(path: str) -> pd.DataFrame:
-    """从附件文本读取（空格分隔，首列是索引）"""
+    """从附件文本读取（空格分隔，首列是索引）。
+
+    容错：跳过前面所有非数据行（例如 futu 连接日志），直到遇到 header 行
+    （以 'time_key' 开头的那一行）。
+    """
     with open(path, 'r', encoding='utf-8') as f:
-        lines = f.readlines()
+        raw_lines = f.readlines()
+    # 定位 header 行
+    header_idx = 0
+    for i, ln in enumerate(raw_lines):
+        toks = re.split(r'\s+', ln.strip())
+        if 'time_key' in toks:
+            header_idx = i
+            break
+    lines = raw_lines[header_idx:]
     header = re.split(r'\s+', lines[0].strip())
     rows = []
     for ln in lines[1:]:
         toks = re.split(r'\s+', ln.strip())
         if len(toks) < 3:
+            continue
+        # 数据行必须以数字（行号）开头，跳过非法行
+        if not toks[0].lstrip('-').isdigit():
             continue
         # 首列是行号，第二三列组合成 time_key
         # 格式: 0 2026-06-02 00:00:00 4995.83 ...
@@ -69,18 +98,47 @@ def load_from_txt(path: str) -> pd.DataFrame:
     df = df.reset_index(drop=True)
     return df
 
-def load_from_futu(stock_code='HK.00700', start='2026-03-11', end='2026-11-25'):
-    """从 futu 拉数据（可选，需要 OpenD 已启动）"""
+
+def load_from_futu(stock_code='HK.800700', start='2026-06-02', end='2026-11-25',
+                   ktype='K_DAY', warmup_days=180):
+    """
+    从 futu 拉数据（可选，需要 OpenD 已启动）。
+
+    ktype 直接透传 futu 官方枚举，常用：
+      - 'K_DAY'   日线
+      - 'K_60M'   1 小时线
+      - 'K_120M'  2 小时线
+      - 'K_240M'  4 小时线
+      - 'K_WEEK'  周线 / 'K_MON' 月线（如有需要）
+
+    warmup_days:
+      为了让 MACD/均线/中枢等指标在用户指定的 start 处已经"预热"，实际拉取时
+      向前多取 warmup_days 天数据；返回值 display_start 用于绘图裁剪。
+      默认 180 天（≈ MA120 + 缓冲，保证 MA250 也能大部分算出）。
+
+    Returns
+    -------
+    (data, display_start) : (pd.DataFrame, pd.Timestamp)
+      data           = 全量 K 线（含预热段）
+      display_start  = 用户实际指定的 start（转成 Timestamp）
+    """
     from futu import OpenQuoteContext, KLType, RET_OK
+
+    user_start = pd.to_datetime(start)
+    fetch_start = (user_start - timedelta(days=warmup_days)).strftime('%Y-%m-%d')
+
     quote_ctx = OpenQuoteContext(host='127.0.0.1', port=11111)
-    ret, data, _ = quote_ctx.request_history_kline(stock_code, start=start, end=end,
-                                                    ktype=KLType.K_DAY)
-    quote_ctx.close()
-    if ret != RET_OK:
-        raise RuntimeError(f"futu 拉取失败: {data}")
-    data = data.sort_values('time_key').reset_index(drop=True)
-    data['time_key'] = pd.to_datetime(data['time_key'])
-    return data
+    try:
+        real_ktype = getattr(KLType, ktype)
+        ret, data, _ = quote_ctx.request_history_kline(
+            stock_code, start=fetch_start, end=end, ktype=real_ktype)
+        if ret != RET_OK:
+            raise RuntimeError(f"futu 拉取 {ktype} 失败: {data}")
+        data = data.sort_values('time_key').reset_index(drop=True)
+        data['time_key'] = pd.to_datetime(data['time_key'])
+    finally:
+        quote_ctx.close()
+    return data, user_start
 
 
 # ================================================================
@@ -788,15 +846,15 @@ def find_buy_sell_points(strokes, pivots, mdf: pd.DataFrame, orig_df: pd.DataFra
         end_i = pv['end_stroke']
         # 情况 A: 中枢内最后一笔就是跌破/突破笔
         last = strokes[end_i]
-        if last['direction'] == 'down' and last['end_price'] < ZD and end_i + 1 < len(strokes):
-            # 有后续笔反弹 → 前一段下跌是"离开"，其终点是 1B? 观察位
+        if last['direction'] == 'down' and last['end_price'] < ZD:
+            # 跌破中枢下沿 → 潜在一买观察位（不再强要求后续有反弹笔）
             dedup_append(buys, {
                 'type': '1B?', 'idx': last['end_idx'],
                 'price': last['end_price'],
                 'note': f'跌破中枢{ZD:.0f}后止跌观察(潜在一买)',
                 'stroke_i': end_i,
             })
-        elif last['direction'] == 'up' and last['end_price'] > ZG and end_i + 1 < len(strokes):
+        elif last['direction'] == 'up' and last['end_price'] > ZG:
             dedup_append(sells, {
                 'type': '1S?', 'idx': last['end_idx'],
                 'price': last['end_price'],
@@ -806,14 +864,14 @@ def find_buy_sell_points(strokes, pivots, mdf: pd.DataFrame, orig_df: pd.DataFra
         # 情况 B: 中枢结束后第一笔是离开笔（未纳入中枢延伸）
         if end_i + 1 < len(strokes):
             leave = strokes[end_i + 1]
-            if leave['direction'] == 'down' and leave['end_price'] < ZD and end_i + 2 < len(strokes):
+            if leave['direction'] == 'down' and leave['end_price'] < ZD:
                 dedup_append(buys, {
                     'type': '1B?', 'idx': leave['end_idx'],
                     'price': leave['end_price'],
                     'note': f'跌破中枢{ZD:.0f}后止跌观察(潜在一买)',
                     'stroke_i': end_i + 1,
                 })
-            elif leave['direction'] == 'up' and leave['end_price'] > ZG and end_i + 2 < len(strokes):
+            elif leave['direction'] == 'up' and leave['end_price'] > ZG:
                 dedup_append(sells, {
                     'type': '1S?', 'idx': leave['end_idx'],
                     'price': leave['end_price'],
@@ -912,7 +970,7 @@ def interpret_market(orig_df, mdf, strokes, pivots, buys, sells):
 
     last_date = orig_df['time_key'].iloc[-1]
     last_close = float(orig_df['close'].iloc[-1])
-    last_date_str = last_date.strftime('%Y-%m-%d') if hasattr(last_date, 'strftime') else str(last_date)[:10]
+    last_date_str = _fmt_ts(last_date, style='full')
     last_stroke = strokes[-1]
 
     lines.append(f'· 最新日期: {last_date_str}   收盘: {last_close:.2f}')
@@ -959,7 +1017,7 @@ def interpret_market(orig_df, mdf, strokes, pivots, buys, sells):
             start_stroke = strokes[last_pivot['start_stroke']]
             piv_t0 = orig_df.iloc[mdf['orig_idx'].values[start_stroke['start_idx']]]['time_key']
             piv_t1 = orig_df.iloc[mdf['orig_idx'].values[end_stroke['end_idx']]]['time_key']
-            piv_range = f'（{piv_t0.strftime("%m-%d")} ~ {piv_t1.strftime("%m-%d")}）'
+            piv_range = f'（{_fmt_ts(piv_t0)} ~ {_fmt_ts(piv_t1)}）'
         except Exception:
             piv_range = ''
 
@@ -997,7 +1055,7 @@ def interpret_market(orig_df, mdf, strokes, pivots, buys, sells):
         latest = formal[-1] if formal else all_pts[-1]
         p, side = latest
         try:
-            sig_date = orig_df.iloc[mdf['orig_idx'].values[p['idx']]]['time_key'].strftime('%Y-%m-%d')
+            sig_date = _fmt_ts(orig_df.iloc[mdf['orig_idx'].values[p['idx']]]['time_key'], style='full')
         except Exception:
             sig_date = '?'
         lines.append(f'· 最近信号: {p["type"]} @ {sig_date}  {p["price"]:.0f}   {p["note"]}')
@@ -1033,8 +1091,14 @@ def interpret_market(orig_df, mdf, strokes, pivots, buys, sells):
 # 7. 可视化
 # ================================================================
 def plot_chan(orig_df, mdf, fractals, strokes, segments, pivots, buys, sells,
-              sub_strokes=None,
+              sub_strokes=None, display_start=None,
               title='恒生科技指数 HK.800700  缠论分析'):
+    """
+    display_start: pd.Timestamp 或 None
+      若非 None，则只在 x 轴上显示 time_key >= display_start 的部分（预热段留给
+      指标计算，不进入可视区域）。所有分型/笔/中枢/买卖点仍是基于全量数据计算，
+      只有 x 轴 xlim 被裁剪。
+    """
     fig = plt.figure(figsize=(22, 11))
     gs = fig.add_gridspec(3, 1, height_ratios=[3, 1, 0.05], hspace=0.08,
                           left=0.05, right=0.72, top=0.94, bottom=0.08)
@@ -1043,7 +1107,20 @@ def plot_chan(orig_df, mdf, fractals, strokes, segments, pivots, buys, sells,
 
     n = len(orig_df)
     x = np.arange(n)
-    dates = orig_df['time_key'].dt.strftime('%m-%d').values
+    # 自适应日期标签：若是日内数据（存在非零小时），显示 月-日 时:分；否则显示 月-日
+    has_intraday = (orig_df['time_key'].dt.hour != 0).any() or \
+                   (orig_df['time_key'].dt.minute != 0).any()
+    if has_intraday:
+        dates = orig_df['time_key'].dt.strftime('%m-%d %H:%M').values
+    else:
+        dates = orig_df['time_key'].dt.strftime('%m-%d').values
+
+    # 计算展示区间起点（预热段之外），供中枢文字/买卖点判定使用
+    if display_start is not None:
+        mask = orig_df['time_key'] >= pd.to_datetime(display_start)
+        x_start = int(np.argmax(mask.values)) if mask.any() else 0
+    else:
+        x_start = 0
 
     # --- K线 ---
     for i in range(n):
@@ -1100,16 +1177,27 @@ def plot_chan(orig_df, mdf, fractals, strokes, segments, pivots, buys, sells,
         ax.plot([x0, x1], [y0, y1], color=color, lw=2.5, alpha=0.55, zorder=4)
 
     # --- 中枢 ---
+    x_end_all = n - 1
     for pv in pivots:
         s_start = strokes[pv['start_stroke']]
         s_end = strokes[pv['end_stroke']]
         x0 = orig_idx_map[s_start['start_idx']]
         x1 = orig_idx_map[s_end['end_idx']]
-        rect = Rectangle((x0, pv['ZD']), x1 - x0, pv['ZG'] - pv['ZD'],
+        # 完全在预热段（可见区间外）的中枢跳过绘制
+        if x1 < x_start:
+            continue
+        # 部分与预热段相交：裁剪矩形起点到可见区间左边界，避免文本/矩形跑到图外
+        vx0 = max(x0, x_start)
+        vx1 = min(x1, x_end_all)
+        if vx1 <= vx0:
+            continue
+        rect = Rectangle((vx0, pv['ZD']), vx1 - vx0, pv['ZG'] - pv['ZD'],
                          facecolor='#f39c12', edgecolor='#d35400',
                          alpha=0.18, lw=1.2, zorder=1.5)
         ax.add_patch(rect)
-        ax.text((x0 + x1) / 2, pv['ZG'], f"中枢[{pv['ZD']:.0f},{pv['ZG']:.0f}]",
+        # 文本 x 位置也约束在可见区间内
+        tx = (vx0 + vx1) / 2
+        ax.text(tx, pv['ZG'], f"中枢[{pv['ZD']:.0f},{pv['ZG']:.0f}]",
                 ha='center', va='bottom', fontsize=8, color='#7f4a00')
 
     # --- 买卖点 ---
@@ -1199,10 +1287,36 @@ def plot_chan(orig_df, mdf, fractals, strokes, segments, pivots, buys, sells,
     axm.grid(True, alpha=0.25)
 
     # X 轴标签
-    step = max(1, n // 15)
-    axm.set_xticks(x[::step])
-    axm.set_xticklabels(dates[::step], rotation=30, ha='right', fontsize=9)
-    ax.set_xlim(-1, n)
+    # x 轴范围：若指定 display_start，只显示预热段之后的区间
+    if display_start is not None:
+        mask = orig_df['time_key'] >= pd.to_datetime(display_start)
+        if mask.any():
+            x_start = int(np.argmax(mask.values))  # 第一个 True 的位置
+        else:
+            x_start = 0
+    else:
+        x_start = 0
+    x_end = n - 1
+    visible_len = x_end - x_start + 1
+    step = max(1, visible_len // 15)
+    tick_pos = np.arange(x_start, x_end + 1, step)
+    axm.set_xticks(tick_pos)
+    axm.set_xticklabels(dates[tick_pos], rotation=30, ha='right', fontsize=9)
+    ax.set_xlim(x_start - 0.5, x_end + 0.5)
+
+    # y 轴自动按可见段缩放（避免预热段的历史价拉扁主图）
+    vis_slice = orig_df.iloc[x_start:x_end + 1]
+    y_lo = float(vis_slice['low'].min())
+    y_hi = float(vis_slice['high'].max())
+    y_pad = (y_hi - y_lo) * 0.05 or 1.0
+    ax.set_ylim(y_lo - y_pad, y_hi + y_pad)
+
+    # MACD 副图 y 轴同理按可见段缩放
+    vis_macd = macdh[x_start:x_end + 1]
+    vis_macd = vis_macd[~np.isnan(vis_macd)]
+    if len(vis_macd):
+        m_max = float(np.abs(vis_macd).max())
+        axm.set_ylim(-m_max * 1.1, m_max * 1.1)
 
     # 已通过 add_gridspec(left/right/top/bottom) 固定布局，无需 tight_layout
     return fig
@@ -1212,13 +1326,54 @@ def plot_chan(orig_df, mdf, fractals, strokes, segments, pivots, buys, sells,
 # 主流程
 # ================================================================
 def main():
-    txt_path = '长文本-1790181607.txt'
-    if os.path.exists(txt_path):
-        orig_df = load_from_txt(txt_path)
-        print(f"[加载] 从本地文本读取 {len(orig_df)} 根K线")
+    import argparse
+    parser = argparse.ArgumentParser(description='缠论日/时线分析')
+    parser.add_argument('--source', choices=['txt', 'futu'], default='futu',
+                        help='数据源：txt 从本地文件读，futu 走 OpenD 拉取')
+    parser.add_argument('--txt', default='长文本-1790229713.txt',
+                        help='本地 txt 数据文件路径（source=txt 时使用）')
+    parser.add_argument('--stock', default='HK.800700',
+                        help='股票/指数代码（source=futu 时使用）')
+    parser.add_argument('--start', default='2026-03-11')
+    parser.add_argument('--end',   default='2026-11-25')
+    parser.add_argument('--ktype',
+                        choices=['K_DAY', 'K_60M', 'K_120M', 'K_240M',
+                                 'K_WEEK', 'K_MON'],
+                        default='K_DAY',
+                        help='K 线周期，直接透传给 futu：日/1H/2H/4H/周/月')
+    parser.add_argument('--out', default='chan_result.png',
+                        help='输出图片路径')
+    parser.add_argument('--warmup', type=int, default=180,
+                        help='futu 数据源预热天数：向前多拉 N 天用于计算 MACD/均线/中枢，'
+                             '展示时裁剪回 --start 起，仅算法计算用全量。默认 180（半年）')
+    parser.add_argument('--display-start', default=None,
+                        help='txt 数据源可选：只展示 >= 此日期的 K 线，之前作为预热段。'
+                             '格式 YYYY-MM-DD。')
+    args = parser.parse_args()
+
+    display_start = None
+    if args.source == 'txt':
+        if not os.path.exists(args.txt):
+            raise FileNotFoundError(f"txt 数据文件不存在: {args.txt}")
+        orig_df = load_from_txt(args.txt)
+        print(f"[加载] 从本地文本读取 {len(orig_df)} 根K线  file={args.txt}")
+        if args.display_start:
+            display_start = pd.to_datetime(args.display_start)
     else:
-        orig_df = load_from_futu()
-        print(f"[加载] 从 futu 拉取 {len(orig_df)} 根K线")
+        orig_df, display_start = load_from_futu(
+            stock_code=args.stock, start=args.start, end=args.end,
+            ktype=args.ktype, warmup_days=args.warmup)
+        n_warm = int((orig_df['time_key'] < display_start).sum())
+        n_show = len(orig_df) - n_warm
+        print(f"[加载] 从 futu 拉取 {len(orig_df)} 根K线  "
+              f"{args.stock} {args.ktype} 预热{n_warm}根 + 展示{n_show}根 "
+              f"(展示区间 {args.start}~{args.end})")
+
+    # 标题依据周期区分
+    ktype_zh = {'K_DAY': '日线', 'K_60M': '1小时线', 'K_120M': '2小时线',
+                'K_240M': '4小时线', 'K_WEEK': '周线', 'K_MON': '月线'}
+    title_ktype = ktype_zh.get(args.ktype, args.ktype)
+    title = f'{args.stock}  缠论分析（{title_ktype}）'
 
     # 若无 MACDh 列，自行计算（防御性）
     if 'MACDh_12_26_9' not in orig_df.columns or orig_df['MACDh_12_26_9'].isna().all():
@@ -1242,8 +1397,8 @@ def main():
     strokes = build_strokes(fractals, mdf, min_k_between=3)
     print(f"[笔] 共 {len(strokes)} 笔")
     for i, s in enumerate(strokes):
-        st = orig_df.loc[mdf['orig_idx'].values[s['start_idx']], 'time_key'].strftime('%m-%d')
-        et = orig_df.loc[mdf['orig_idx'].values[s['end_idx']], 'time_key'].strftime('%m-%d')
+        st = _fmt_ts(orig_df.loc[mdf['orig_idx'].values[s['start_idx']], 'time_key'])
+        et = _fmt_ts(orig_df.loc[mdf['orig_idx'].values[s['end_idx']], 'time_key'])
         print(f"  笔{i:2d} {s['direction']:4s} {st}({s['start_price']:.2f}) -> {et}({s['end_price']:.2f})")
 
     # 4. 线段
@@ -1284,8 +1439,9 @@ def main():
             )
             print(f"  笔{i}: {pts_str}")
     fig = plot_chan(orig_df, mdf, fractals, strokes, segments, pivots,
-                    buys, sells, sub_strokes=sub_strokes)
-    out_png = 'chan_result.png'
+                    buys, sells, sub_strokes=sub_strokes,
+                    display_start=display_start, title=title)
+    out_png = args.out
     fig.savefig(out_png, dpi=140, bbox_inches='tight')
     print(f"[保存] {out_png}")
     plt.show()
