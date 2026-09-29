@@ -1641,12 +1641,15 @@ def explain_signal(sig, mdf, strokes, pivots, all_buys=None, all_sells=None):
     # 失败/撤销：加一行原文级说明
     if sig.get('failed'):
         d_fail = sig.get('failed_dt', '?')
+        p_key = sig['price']
         if base_type == '1B':
-            lines.append(f'  [失败] {d_fail} 跌破本低点 → 一买失败（原文 78：止损为唯一动作）')
+            lines.append(f'  [失败] {d_fail} 跌破本低点 {p_key:.0f} → '
+                         f'一买失败（原文 78：止损为唯一动作）')
         elif base_type == '1S':
-            lines.append(f'  [失败] {d_fail} 升破本高点 → 一卖失败（原文 78：止盈为唯一动作）')
+            lines.append(f'  [失败] {d_fail} 升破本高点 {p_key:.0f} → '
+                         f'一卖失败（原文 78：止盈为唯一动作）')
         else:
-            lines.append(f'  [失败] {d_fail} 关键位被击穿')
+            lines.append(f'  [失败] {d_fail} 关键位 {p_key:.0f} 被击穿')
     elif sig.get('invalidated'):
         lines.append('  [撤销] 前置一买/一卖已失败 → 本派生信号自动作废')
 
@@ -1846,7 +1849,8 @@ def detect_move_combinations(moves):
     return out
 
 
-def interpret_market(orig_df, mdf, strokes, pivots, buys, sells):
+def interpret_market(orig_df, mdf, strokes, pivots, buys, sells,
+                     display_start=None):
     """
     基于《缠中说禅》原文（教你炒股票 17-25、63-84）生成当下走势解读文本。
     输出 list[str]，每项一行。
@@ -1967,15 +1971,18 @@ def interpret_market(orig_df, mdf, strokes, pivots, buys, sells):
         lines.append(f'· 最近信号: {p["type"]} @ {sig_date}  {p["price"]:.0f}   {p["note"]}')
 
         t = p['type']
+        p_key = p['price']
         # 依据最近信号给出跟进操作（原文 47-59, 75-84 页）
         if t == '1B':
-            lines.append('  ▸ 一买已现 → 等次级别反弹后回抽不破本低点，成立二买；组合建仓')
+            lines.append(f'  ▸ 一买已现 → 等次级别反弹后回抽不破本低点 {p_key:.0f}，'
+                         f'成立二买；组合建仓')
         elif t == '2B':
             lines.append('  ▸ 二买已现 → 上涨延续；若后续突破前中枢 ZG 且回抽不入 → 三买加仓')
         elif t == '3B':
             lines.append('  ▸ 三买已现 → 上涨中枢移动确立；持有，直至出现顶背驰做一卖')
         elif t == '1S':
-            lines.append('  ▸ 一卖已现 → 等次级别回落后反抽不破本高点，成立二卖；组合减仓')
+            lines.append(f'  ▸ 一卖已现 → 等次级别回落后反抽不破本高点 {p_key:.0f}，'
+                         f'成立二卖；组合减仓')
         elif t == '2S':
             lines.append('  ▸ 二卖已现 → 下跌延续；若后续跌破前中枢 ZD 且反抽不入 → 三卖清仓')
         elif t == '3S':
@@ -1984,8 +1991,33 @@ def interpret_market(orig_df, mdf, strokes, pivots, buys, sells):
         lines.append('· 最近信号: 无')
 
     # ---------- 失败告警（原文《教你炒股票 72/78》）----------
-    failed_1b = [b for b in buys if b['type'].rstrip('?') == '1B' and b.get('failed')]
-    failed_1s = [s for s in sells if s['type'].rstrip('?') == '1S' and s.get('failed')]
+    # 展示区间过滤：只对 failed_at 落在 display_start 之后的失败告警，
+    # 避免把预热段的历史失败当成"当下"告警。
+    ds_ts = pd.to_datetime(display_start) if display_start is not None else None
+
+    def _failed_ts(sig):
+        """取失败发生那根 K 的 time_key（mdf 索引 → orig_idx → time_key）。"""
+        try:
+            fa = sig.get('failed_at')
+            if fa is None:
+                return None
+            oi = mdf['orig_idx'].values[fa]
+            return orig_df.iloc[oi]['time_key']
+        except Exception:
+            return None
+
+    def _in_display(sig):
+        if ds_ts is None:
+            return True
+        t = _failed_ts(sig)
+        return (t is None) or (t >= ds_ts)
+
+    failed_1b = [b for b in buys
+                 if b['type'].rstrip('?') == '1B'
+                 and b.get('failed') and _in_display(b)]
+    failed_1s = [s for s in sells
+                 if s['type'].rstrip('?') == '1S'
+                 and s.get('failed') and _in_display(s)]
     # 只对"最近的失败"进行告警，避免历史失败满屏
     def _sig_date(sig):
         try:
@@ -1994,7 +2026,9 @@ def interpret_market(orig_df, mdf, strokes, pivots, buys, sells):
         except Exception:
             return '?'
     if failed_1b:
-        last_fb = max(failed_1b, key=lambda x: x['idx'])
+        # 按失败发生日期取最新一个；同日再按信号 idx 取最新
+        last_fb = max(failed_1b,
+                      key=lambda x: (x.get('failed_at', 0), x['idx']))
         d0 = _sig_date(last_fb)
         d1 = last_fb.get('failed_dt', '?')
         lines.append(
@@ -2004,7 +2038,8 @@ def interpret_market(orig_df, mdf, strokes, pivots, buys, sells):
         lines.append('  ▸ 原文《教你炒股票 78》: 止损为唯一动作；此为"背驰段的再背驰"，'
                      '空仓等新的日线级别底背驰或周线级别背驰')
     if failed_1s:
-        last_fs = max(failed_1s, key=lambda x: x['idx'])
+        last_fs = max(failed_1s,
+                      key=lambda x: (x.get('failed_at', 0), x['idx']))
         d0 = _sig_date(last_fs)
         d1 = last_fs.get('failed_dt', '?')
         lines.append(
@@ -2014,13 +2049,45 @@ def interpret_market(orig_df, mdf, strokes, pivots, buys, sells):
         lines.append('  ▸ 原文《教你炒股票 78》: 止盈为唯一动作；'
                      '此为"背驰段的再背驰"，空仓等新的日线级别顶背驰')
 
-    n_inv = sum(1 for b in buys if b.get('invalidated')) + \
-            sum(1 for s in sells if s.get('invalidated'))
+    # 撤销信号：也按展示区间过滤（用信号自身的 idx 对应的 time_key）
+    def _sig_ts(sig):
+        try:
+            oi = mdf['orig_idx'].values[sig['idx']]
+            return orig_df.iloc[oi]['time_key']
+        except Exception:
+            return None
+
+    def _inv_in_display(sig):
+        if ds_ts is None:
+            return True
+        t = _sig_ts(sig)
+        return (t is None) or (t >= ds_ts)
+
+    n_inv = sum(1 for b in buys if b.get('invalidated') and _inv_in_display(b)) + \
+            sum(1 for s in sells if s.get('invalidated') and _inv_in_display(s))
     if n_inv > 0:
         lines.append(f'⊘ 已撤销派生信号: {n_inv} 个（前置一买/一卖失败）')
 
-    n_broken = sum(1 for pv in pivots if pv.get('broken'))
-    n_breakout = sum(1 for pv in pivots if pv.get('breakout'))
+    # 中枢结构修正：同样按展示区间过滤（用中枢最后一笔的 end_idx 对应的 time_key）
+    def _pivot_end_ts(pv):
+        try:
+            es = pv.get('end_stroke')
+            if es is None or es >= len(strokes):
+                return None
+            end_idx = strokes[es]['end_idx']
+            oi = mdf['orig_idx'].values[end_idx]
+            return orig_df.iloc[oi]['time_key']
+        except Exception:
+            return None
+
+    def _pv_in_display(pv):
+        if ds_ts is None:
+            return True
+        t = _pivot_end_ts(pv)
+        return (t is None) or (t >= ds_ts)
+
+    n_broken = sum(1 for pv in pivots if pv.get('broken') and _pv_in_display(pv))
+    n_breakout = sum(1 for pv in pivots if pv.get('breakout') and _pv_in_display(pv))
     if n_broken or n_breakout:
         seg = []
         if n_broken:
@@ -2032,8 +2099,9 @@ def interpret_market(orig_df, mdf, strokes, pivots, buys, sells):
     # ---------- 破位反抽告警（原文《教你炒股票 24-25/72/78》）----------
     # 只对"最近一个"处于反抽中的 1B/1S 输出剧本预警
     # 判据：优先 failed_at 最晚；同 failed_at 时选 idx 最晚（更新的信号）
+    # 同样按 display_start 过滤，避免历史反抽干扰
     rebound_sigs = [s for s in list(buys) + list(sells)
-                    if s.get('rebound_active')]
+                    if s.get('rebound_active') and _in_display(s)]
     if rebound_sigs:
         latest_rb = max(rebound_sigs,
                         key=lambda x: (x.get('failed_at', 0), x.get('idx', 0)))
@@ -2062,33 +2130,55 @@ def interpret_market(orig_df, mdf, strokes, pivots, buys, sells):
         # 三种模式的对应操作建议（原文剧本）
         if mode == 'weak':
             if is_buy:
-                lines.append('  ▸ 反抽未回本低点 → 卖方压制强，后续大概率继续新低；'
-                             '若还有仓位，此反抽即最后离场机会')
+                lines.append(f'  ▸ 反抽高点 {p_reb:.0f} 未回本低点 {p_fail:.0f} → '
+                             f'卖方压制强，后续大概率继续新低；'
+                             f'若还有仓位，此反抽即最后离场机会')
             else:
-                lines.append('  ▸ 反抽未回本高点 → 买方推力强，后续大概率继续新高；'
-                             '若做空，此反抽即最后覆盖机会')
+                lines.append(f'  ▸ 反抽低点 {p_reb:.0f} 未回本高点 {p_fail:.0f} → '
+                             f'买方推力强，后续大概率继续新高；'
+                             f'若做空，此反抽即最后覆盖机会')
         elif mode == 'standard':
             if is_buy:
-                lines.append('  ▸ 反抽已至前低附近 → 教科书级"支撑变阻力"，'
-                             '按原文 78 应在此位置离场；此为新的次级别一卖')
+                lines.append(f'  ▸ 反抽已至前低 {p_fail:.0f} 附近（现 {p_reb:.0f}）→ '
+                             f'教科书级"支撑变阻力"，'
+                             f'按原文 78 应在此位置离场；此为新的次级别一卖')
             else:
-                lines.append('  ▸ 反抽已至前高附近 → 教科书级"阻力变支撑"，'
-                             '按原文 78 应在此位置离场空单；此为新的次级别一买')
+                lines.append(f'  ▸ 反抽已至前高 {p_fail:.0f} 附近（现 {p_reb:.0f}）→ '
+                             f'教科书级"阻力变支撑"，'
+                             f'按原文 78 应在此位置离场空单；此为新的次级别一买')
         elif mode == 'fake_breakout':
             if is_buy:
-                lines.append('  ▸ 反抽已越过前低 → 疑似假破位，'
-                             '需等 3-5 根 K 站稳前低之上才能翻多；盘中翻多是错误')
+                lines.append(f'  ▸ 反抽 {p_reb:.0f} 已越过前低 {p_fail:.0f} → '
+                             f'疑似假破位，'
+                             f'需等 3-5 根 K 站稳前低 {p_fail:.0f} 之上才能翻多；'
+                             f'盘中翻多是错误')
             else:
-                lines.append('  ▸ 反抽已越过前高 → 疑似假突破，'
-                             '需等 3-5 根 K 站稳前高之下才能翻空；盘中翻空是错误')
+                lines.append(f'  ▸ 反抽 {p_reb:.0f} 已越过前高 {p_fail:.0f} → '
+                             f'疑似假突破，'
+                             f'需等 3-5 根 K 站稳前高 {p_fail:.0f} 之下才能翻空；'
+                             f'盘中翻空是错误')
         lines.append('  ▸ 原文《教你炒股票 78》: 破位反抽是撤退窗口，不是买卖点')
 
     # ---------- 补充：级别提示 ----------
-    n_up_str = sum(1 for s in strokes if s['direction'] == 'up')
-    n_dn_str = sum(1 for s in strokes if s['direction'] == 'down')
-    lines.append(f'· 结构统计: {len(strokes)} 笔（{n_up_str} 上 / {n_dn_str} 下），'
-                 f'{len(pivots)} 中枢，'
-                 f'买 {len(buys)} 卖 {len(sells)}')
+    # 结构统计：按展示区间过滤，避免预热段的历史统计混入
+    def _stroke_in_display(st):
+        if ds_ts is None:
+            return True
+        try:
+            oi = mdf['orig_idx'].values[st['end_idx']]
+            return orig_df.iloc[oi]['time_key'] >= ds_ts
+        except Exception:
+            return True
+
+    strokes_d = [s for s in strokes if _stroke_in_display(s)]
+    pivots_d = [pv for pv in pivots if _pv_in_display(pv)]
+    buys_d = [b for b in buys if _inv_in_display(b)]  # _inv_in_display 复用（按信号自身日期）
+    sells_d = [s for s in sells if _inv_in_display(s)]
+    n_up_str = sum(1 for s in strokes_d if s['direction'] == 'up')
+    n_dn_str = sum(1 for s in strokes_d if s['direction'] == 'down')
+    lines.append(f'· 结构统计: {len(strokes_d)} 笔（{n_up_str} 上 / {n_dn_str} 下），'
+                 f'{len(pivots_d)} 中枢，'
+                 f'买 {len(buys_d)} 卖 {len(sells_d)}')
 
     return lines
 
@@ -2488,7 +2578,8 @@ def plot_chan(orig_df, mdf, fractals, strokes, segments, pivots, buys, sells,
     ax.grid(True, alpha=0.25)
 
     # 当下走势解读（放到主图右侧图外，避免遮挡 K 线）
-    interp_lines = interpret_market(orig_df, mdf, strokes, pivots, buys, sells)
+    interp_lines = interpret_market(orig_df, mdf, strokes, pivots, buys, sells,
+                                    display_start=display_start)
     interp_text = '\n'.join(interp_lines)
     # 上半：当下走势解读
     fig.text(0.735, 0.94, interp_text,
@@ -2618,7 +2709,7 @@ def main():
                              '本次触发依据）。设 0 关闭。默认 5。')
     parser.add_argument('--recent-only-formal', action='store_true',
                         help='最近信号只显示正式买卖点（不含 1B?/2B?/1S?/2S? 等潜在点）。')
-    parser.add_argument('--hide-fractals', action='store_false',
+    parser.add_argument('--hide-fractals', action='store_true',
                         help='隐藏图上的顶/底分型箭头（橙色向下箭头=顶分型，蓝色向上箭头=底分型）。'
                              '默认显示；仅影响绘图，不影响笔/线段/中枢/买卖点的计算。')
     parser.add_argument('--hide-trend-moves', action='store_true',
