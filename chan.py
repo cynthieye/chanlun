@@ -1213,6 +1213,283 @@ def find_buy_sell_points(strokes, pivots, mdf: pd.DataFrame, orig_df: pd.DataFra
 
 
 # ================================================================
+# 6.5 信号失败检测 + 回溯撤销 + 中枢延续修正
+#      原文《教你炒股票 72/78》：
+#        "任何买点被跌破，都意味着你对当前走势结构的判断是错的。
+#         结构错了，就不存在'再等等看'，止损是唯一动作。"
+#      "背驰段的再背驰：当下的背驰段本身构成下一次背驰的对照段。"
+# ================================================================
+def detect_failed_signals(buys, sells, mdf, orig_df,
+                          break_tolerance=0.0):
+    """
+    检测每个 1B / 1B? / 1S / 1S? 是否被后续走势"跌破/升破"。
+
+    判据（原文 78 讲）：
+      - 1B 失败：从 1B 触发点之后（stroke_i 对应笔的终点之后）
+                任意 K 线的 low 收盘或盘中价 < 1B.price - tol
+      - 1S 失败：任意 K 线的 high > 1S.price + tol
+      - break_tolerance: 相对价格容差（默认 0，严格按低点判定）
+
+    直接在原 dict 上原地写入：
+      sig['failed']    = True/False
+      sig['failed_at'] = 触发失败的 K 索引（mdf 索引）
+      sig['failed_dt'] = 触发失败的日期字符串
+      sig['failed_by'] = 'break_1b_low' / 'break_1s_high'
+
+    return (buys, sells)  # 同引用，方便链式调用
+    """
+    lows = mdf['low'].values
+    highs = mdf['high'].values
+    n = len(mdf)
+
+    def _mark_failed(sig, at_idx, kind):
+        sig['failed'] = True
+        sig['failed_at'] = int(at_idx)
+        sig['failed_by'] = kind
+        try:
+            sig['failed_dt'] = _fmt_ts(mdf['time_key'].iloc[at_idx], style='full')
+        except Exception:
+            sig['failed_dt'] = ''
+
+    for b in buys:
+        base = b['type'].rstrip('?')
+        if base != '1B':
+            b.setdefault('failed', False)
+            continue
+        start_idx = int(b['idx']) + 1  # 从触发点下一根开始查
+        limit = float(b['price']) - break_tolerance
+        found = False
+        for k in range(start_idx, n):
+            if lows[k] < limit:
+                _mark_failed(b, k, 'break_1b_low')
+                found = True
+                break
+        if not found:
+            b['failed'] = False
+
+    for s in sells:
+        base = s['type'].rstrip('?')
+        if base != '1S':
+            s.setdefault('failed', False)
+            continue
+        start_idx = int(s['idx']) + 1
+        limit = float(s['price']) + break_tolerance
+        found = False
+        for k in range(start_idx, n):
+            if highs[k] > limit:
+                _mark_failed(s, k, 'break_1s_high')
+                found = True
+                break
+        if not found:
+            s['failed'] = False
+
+    return buys, sells
+
+
+def cascade_invalidate_derived_signals(buys, sells):
+    """
+    信号回溯撤销：
+      失败的 1B 触发的 2B（'一买后回抽不破 1B(xxx)' / '一买后回抽已破...'）
+      必然失效——因为 2B 的定义"回抽不破一买低点"，前提没了。
+      对称地，失败的 1S 触发的 2S 也失效。
+
+    通过 note 里的价格数字匹配 —— note 形如 '一买后回抽不破 1B(4246)'。
+    原地写入：sig['invalidated'] = True / 'invalidated_by' = 触发失败的信号 dict
+
+    return (buys, sells)
+    """
+    import re as _re
+
+    failed_1b_prices = [b['price'] for b in buys
+                        if b['type'].rstrip('?') == '1B' and b.get('failed')]
+    failed_1s_prices = [s['price'] for s in sells
+                        if s['type'].rstrip('?') == '1S' and s.get('failed')]
+
+    def _note_price(note):
+        m = _re.search(r'1[BS]\((\d+(?:\.\d+)?)\)', note or '')
+        return float(m.group(1)) if m else None
+
+    for b in buys:
+        base = b['type'].rstrip('?')
+        if base != '2B':
+            b.setdefault('invalidated', False)
+            continue
+        p = _note_price(b.get('note', ''))
+        if p is None:
+            b['invalidated'] = False
+            continue
+        # 若 note 里的 1B 参考价对应任一失败的 1B（允许 0.5% 容差）→ 该 2B 无效
+        hit = any(abs(p - fp) / max(fp, 1e-9) < 5e-3 for fp in failed_1b_prices)
+        b['invalidated'] = hit
+
+    for s in sells:
+        base = s['type'].rstrip('?')
+        if base != '2S':
+            s.setdefault('invalidated', False)
+            continue
+        p = _note_price(s.get('note', ''))
+        if p is None:
+            s['invalidated'] = False
+            continue
+        hit = any(abs(p - fp) / max(fp, 1e-9) < 5e-3 for fp in failed_1s_prices)
+        s['invalidated'] = hit
+
+    return buys, sells
+
+
+def rectify_pivots_by_failure(pivots, strokes, mdf, buys, sells):
+    """
+    中枢延续修正（原文《教你炒股票 20/72》）：
+
+      若中枢 [ZD, ZG] 结束后，出现价格严重跌破 ZD（或升破 ZG）到达一定深度，
+      说明"离开中枢的那段"并不是真正的三卖/三买行情，而是**该中枢下一次延伸**
+      被误判为背驰段。此时应把该中枢标记为 broken=True，说明"背驰段的再背驰"。
+
+    判据：
+      - 中枢的 end_stroke 之后（strokes 里往后扫），若任一后续 K 线的 low 跌破
+        ZD 且深度 (ZD - low) / (ZG - ZD) >= 0.5，或者 low 跌破了 DD（波动区间下沿），
+        则视为"中枢被有效跌破"（对应触发 3S）
+      - 类似地，high 升破 ZG 且深度 (high - ZG) / (ZG - ZD) >= 0.5 或 high > GG →
+        中枢被有效突破（对应触发 3B）
+      - 已经在原代码 relation 分类之外，这里只额外标 broken/breakout 便于绘图与解读
+
+    原地写入：
+      pv['broken']         = True/False（ZD 被有效跌破）
+      pv['broken_at']      = 触发跌破的 K 索引
+      pv['breakout']       = True/False（ZG 被有效突破）
+      pv['breakout_at']    = 触发突破的 K 索引
+
+    return pivots
+    """
+    lows = mdf['low'].values
+    highs = mdf['high'].values
+    n = len(mdf)
+
+    for pv in pivots:
+        pv.setdefault('broken', False)
+        pv.setdefault('breakout', False)
+        end_stroke_i = pv.get('end_stroke', -1)
+        if not (0 <= end_stroke_i < len(strokes)):
+            continue
+        # 从中枢结束笔的终点 K 下一根开始扫
+        end_k = int(strokes[end_stroke_i]['end_idx']) + 1
+        ZG, ZD = float(pv['ZG']), float(pv['ZD'])
+        DD, GG = float(pv.get('DD', ZD)), float(pv.get('GG', ZG))
+        height = max(ZG - ZD, 1e-9)
+
+        for k in range(end_k, n):
+            lo, hi = lows[k], highs[k]
+            # 跌破：low 到达 DD 或 (ZD - lo)/height >= 0.5
+            if not pv['broken']:
+                if lo < DD or (ZD - lo) / height >= 0.5:
+                    pv['broken'] = True
+                    pv['broken_at'] = int(k)
+            # 突破：high 到达 GG 或 (hi - ZG)/height >= 0.5
+            if not pv['breakout']:
+                if hi > GG or (hi - ZG) / height >= 0.5:
+                    pv['breakout'] = True
+                    pv['breakout_at'] = int(k)
+            if pv['broken'] and pv['breakout']:
+                break
+    return pivots
+
+
+def detect_break_rebounds(buys, sells, mdf, window_bars=20,
+                          weak_threshold=0.995,
+                          fake_threshold=1.005):
+    """
+    识别"破位反抽"（原文《教你炒股票 24-25/72/78》）。
+
+    对每个 failed 的 1B / 1S，从其 failed_at（破位那根 K）向后扫 window_bars 根 K：
+      - 找到"迄今为止的反抽极值"：1B 破位后看 high 的最高；1S 破位后看 low 的最低
+      - 按反抽极值 vs 被跌破的关键位（sig.price）判定模式：
+          * 1B 破位反抽:
+              rebound_high < price * weak_threshold      → 模式A 弱反抽
+              price * weak_threshold ≤ rebound_high ≤ price * fake_threshold  → 模式B 标准反抽
+              rebound_high > price * fake_threshold      → 模式C 疑似假破位
+          * 1S 对称
+
+    在 sig 上原地写入：
+      sig['rebound_active']    True/False  是否进入反抽阶段（破位后有过 K 线）
+      sig['rebound_at']        反抽极值所在的 K 索引（迄今为止）
+      sig['rebound_price']     反抽极值
+      sig['rebound_mode']      'weak' / 'standard' / 'fake_breakout' / 'none'
+      sig['rebound_from']      破位那根 K 索引（= failed_at）
+      sig['rebound_window']    实际扫描到的 K 数（可能 < window_bars 因为数据到最新为止）
+    """
+    lows = mdf['low'].values
+    highs = mdf['high'].values
+    n = len(mdf)
+
+    def _classify_rebound(sig, is_buy):
+        if not sig.get('failed'):
+            return
+        fa = sig.get('failed_at')
+        if fa is None:
+            return
+        # 反抽窗口：从破位那根 K【自身】开始（同一天可能先破后反弹），
+        # 到 failed_at + window_bars 根 K 为止
+        end = min(n, fa + 1 + window_bars)
+        sig['rebound_from'] = int(fa)
+        sig['rebound_window'] = end - fa
+        if end <= fa:
+            sig['rebound_active'] = False
+            sig['rebound_mode'] = 'none'
+            return
+
+        price = float(sig['price'])
+        if is_buy:
+            # 1B 破位：反抽看 high 的最大（含破位当根 K 的 high）
+            seg = highs[fa:end]
+            k_off = int(seg.argmax())
+            rebound = float(seg[k_off])
+            weak_line = price * weak_threshold
+            fake_line = price * fake_threshold
+            if rebound < weak_line:
+                mode = 'weak'
+            elif rebound > fake_line:
+                mode = 'fake_breakout'
+            else:
+                mode = 'standard'
+        else:
+            # 1S 破位：反抽看 low 的最小（含破位当根 K 的 low）
+            seg = lows[fa:end]
+            k_off = int(seg.argmin())
+            rebound = float(seg[k_off])
+            weak_line = price * (2 - weak_threshold)
+            fake_line = price * (2 - fake_threshold)
+            if rebound > weak_line:
+                mode = 'weak'
+            elif rebound < fake_line:
+                mode = 'fake_breakout'
+            else:
+                mode = 'standard'
+
+        sig['rebound_active'] = True
+        sig['rebound_at'] = int(fa + k_off)
+        sig['rebound_price'] = rebound
+        sig['rebound_mode'] = mode
+
+    for b in buys:
+        if b['type'].rstrip('?') == '1B':
+            _classify_rebound(b, is_buy=True)
+    for s in sells:
+        if s['type'].rstrip('?') == '1S':
+            _classify_rebound(s, is_buy=False)
+
+    return buys, sells
+
+
+def apply_signal_failure_pipeline(buys, sells, pivots, strokes, mdf, orig_df):
+    """一键调用四步：失败检测 → 派生信号撤销 → 中枢延续修正 → 破位反抽识别。"""
+    detect_failed_signals(buys, sells, mdf, orig_df)
+    cascade_invalidate_derived_signals(buys, sells)
+    rectify_pivots_by_failure(pivots, strokes, mdf, buys, sells)
+    detect_break_rebounds(buys, sells, mdf)
+    return buys, sells, pivots
+
+
+# ================================================================
 # 7. 单个买卖点的详细解释（配合"最近 N 个信号"图上说明）
 # ================================================================
 _TYPE_DEFS = {
@@ -1318,8 +1595,15 @@ def explain_signal(sig, mdf, strokes, pivots, all_buys=None, all_sells=None):
     dt = _fmt_ts(mdf['time_key'].iloc[sig['idx']], style='full')
 
     lines = []
-    # 首行：日期 类型 价格
-    tag = '（潜在观察）' if is_pending else ''
+    # 首行：日期 类型 价格，附上失败/撤销状态
+    status_bits = []
+    if is_pending:
+        status_bits.append('潜在观察')
+    if sig.get('failed'):
+        status_bits.append('✗ 已失败')
+    elif sig.get('invalidated'):
+        status_bits.append('⊘ 已撤销')
+    tag = f'（{"·".join(status_bits)}）' if status_bits else ''
     lines.append(f'· {dt}  {typ_name}{tag}  @ {sig["price"]:.2f}')
 
     # 第二行：原文定义（精简版）
@@ -1353,6 +1637,18 @@ def explain_signal(sig, mdf, strokes, pivots, all_buys=None, all_sells=None):
     for bit in reason_bits:
         if bit:
             lines.append(f'  [依据] {bit}')
+
+    # 失败/撤销：加一行原文级说明
+    if sig.get('failed'):
+        d_fail = sig.get('failed_dt', '?')
+        if base_type == '1B':
+            lines.append(f'  [失败] {d_fail} 跌破本低点 → 一买失败（原文 78：止损为唯一动作）')
+        elif base_type == '1S':
+            lines.append(f'  [失败] {d_fail} 升破本高点 → 一卖失败（原文 78：止盈为唯一动作）')
+        else:
+            lines.append(f'  [失败] {d_fail} 关键位被击穿')
+    elif sig.get('invalidated'):
+        lines.append('  [撤销] 前置一买/一卖已失败 → 本派生信号自动作废')
 
     # 级别标注：同一位置同时出现 3S/3B 与 1B?/1S? 时按原文"卖买同源、级别不同"提示
     if all_buys is not None and all_sells is not None:
@@ -1687,6 +1983,106 @@ def interpret_market(orig_df, mdf, strokes, pivots, buys, sells):
     else:
         lines.append('· 最近信号: 无')
 
+    # ---------- 失败告警（原文《教你炒股票 72/78》）----------
+    failed_1b = [b for b in buys if b['type'].rstrip('?') == '1B' and b.get('failed')]
+    failed_1s = [s for s in sells if s['type'].rstrip('?') == '1S' and s.get('failed')]
+    # 只对"最近的失败"进行告警，避免历史失败满屏
+    def _sig_date(sig):
+        try:
+            return _fmt_ts(orig_df.iloc[mdf['orig_idx'].values[sig['idx']]]['time_key'],
+                           style='short')
+        except Exception:
+            return '?'
+    if failed_1b:
+        last_fb = max(failed_1b, key=lambda x: x['idx'])
+        d0 = _sig_date(last_fb)
+        d1 = last_fb.get('failed_dt', '?')
+        lines.append(
+            f'⚠ 一买失败告警: {last_fb["type"]} {d0} @ {last_fb["price"]:.0f} '
+            f'已于 {d1} 被跌破'
+        )
+        lines.append('  ▸ 原文《教你炒股票 78》: 止损为唯一动作；此为"背驰段的再背驰"，'
+                     '空仓等新的日线级别底背驰或周线级别背驰')
+    if failed_1s:
+        last_fs = max(failed_1s, key=lambda x: x['idx'])
+        d0 = _sig_date(last_fs)
+        d1 = last_fs.get('failed_dt', '?')
+        lines.append(
+            f'⚠ 一卖失败告警: {last_fs["type"]} {d0} @ {last_fs["price"]:.0f} '
+            f'已于 {d1} 被升破'
+        )
+        lines.append('  ▸ 原文《教你炒股票 78》: 止盈为唯一动作；'
+                     '此为"背驰段的再背驰"，空仓等新的日线级别顶背驰')
+
+    n_inv = sum(1 for b in buys if b.get('invalidated')) + \
+            sum(1 for s in sells if s.get('invalidated'))
+    if n_inv > 0:
+        lines.append(f'⊘ 已撤销派生信号: {n_inv} 个（前置一买/一卖失败）')
+
+    n_broken = sum(1 for pv in pivots if pv.get('broken'))
+    n_breakout = sum(1 for pv in pivots if pv.get('breakout'))
+    if n_broken or n_breakout:
+        seg = []
+        if n_broken:
+            seg.append(f'{n_broken} 个中枢被跌破')
+        if n_breakout:
+            seg.append(f'{n_breakout} 个中枢被突破')
+        lines.append(f'· 中枢结构修正: ' + '，'.join(seg))
+
+    # ---------- 破位反抽告警（原文《教你炒股票 24-25/72/78》）----------
+    # 只对"最近一个"处于反抽中的 1B/1S 输出剧本预警
+    # 判据：优先 failed_at 最晚；同 failed_at 时选 idx 最晚（更新的信号）
+    rebound_sigs = [s for s in list(buys) + list(sells)
+                    if s.get('rebound_active')]
+    if rebound_sigs:
+        latest_rb = max(rebound_sigs,
+                        key=lambda x: (x.get('failed_at', 0), x.get('idx', 0)))
+        base = latest_rb['type'].rstrip('?')
+        is_buy = base == '1B'
+        mode = latest_rb.get('rebound_mode', 'standard')
+        mode_zh = {
+            'weak': '模式A 弱反抽',
+            'standard': '模式B 标准反抽',
+            'fake_breakout': '模式C 疑似假破位',
+        }.get(mode, mode)
+        try:
+            d_fail = latest_rb.get('failed_dt', '?')
+            d_reb = _fmt_ts(mdf['time_key'].iloc[latest_rb['rebound_at']],
+                            style='short')
+        except Exception:
+            d_reb = '?'
+        p_fail = latest_rb['price']
+        p_reb = latest_rb.get('rebound_price', p_fail)
+
+        # 剧本走的方向
+        arrow = '↑反抽' if is_buy else '↓反抽'
+        lines.append(f'⚠ 破位反抽进行中: {latest_rb["type"]}✗ '
+                     f'{d_fail} 破位 {p_fail:.0f}, {d_reb} {arrow}至 {p_reb:.0f}'
+                     f'  [{mode_zh}]')
+        # 三种模式的对应操作建议（原文剧本）
+        if mode == 'weak':
+            if is_buy:
+                lines.append('  ▸ 反抽未回本低点 → 卖方压制强，后续大概率继续新低；'
+                             '若还有仓位，此反抽即最后离场机会')
+            else:
+                lines.append('  ▸ 反抽未回本高点 → 买方推力强，后续大概率继续新高；'
+                             '若做空，此反抽即最后覆盖机会')
+        elif mode == 'standard':
+            if is_buy:
+                lines.append('  ▸ 反抽已至前低附近 → 教科书级"支撑变阻力"，'
+                             '按原文 78 应在此位置离场；此为新的次级别一卖')
+            else:
+                lines.append('  ▸ 反抽已至前高附近 → 教科书级"阻力变支撑"，'
+                             '按原文 78 应在此位置离场空单；此为新的次级别一买')
+        elif mode == 'fake_breakout':
+            if is_buy:
+                lines.append('  ▸ 反抽已越过前低 → 疑似假破位，'
+                             '需等 3-5 根 K 站稳前低之上才能翻多；盘中翻多是错误')
+            else:
+                lines.append('  ▸ 反抽已越过前高 → 疑似假突破，'
+                             '需等 3-5 根 K 站稳前高之下才能翻空；盘中翻空是错误')
+        lines.append('  ▸ 原文《教你炒股票 78》: 破位反抽是撤退窗口，不是买卖点')
+
     # ---------- 补充：级别提示 ----------
     n_up_str = sum(1 for s in strokes if s['direction'] == 'up')
     n_dn_str = sum(1 for s in strokes if s['direction'] == 'down')
@@ -1812,14 +2208,87 @@ def plot_chan(orig_df, mdf, fractals, strokes, segments, pivots, buys, sells,
         vx1 = min(x1, x_end_all)
         if vx1 <= vx0:
             continue
-        rect = Rectangle((vx0, pv['ZD']), vx1 - vx0, pv['ZG'] - pv['ZD'],
-                         facecolor='#f39c12', edgecolor='#d35400',
-                         alpha=0.18, lw=1.2, zorder=1.5)
+        # 中枢是否已被有效跌破/突破（原文《教你炒股票 20/72》：背驰段的再背驰）
+        is_broken = bool(pv.get('broken'))
+        is_breakout = bool(pv.get('breakout'))
+        if is_broken and not is_breakout:
+            # 已跌破：虚线红边 + 浅灰填充
+            rect = Rectangle((vx0, pv['ZD']), vx1 - vx0, pv['ZG'] - pv['ZD'],
+                             facecolor='#bdc3c7', edgecolor='#c0392b',
+                             alpha=0.22, lw=1.2, ls='--', zorder=1.5)
+        elif is_breakout and not is_broken:
+            # 已突破：虚线红边（上方向）
+            rect = Rectangle((vx0, pv['ZD']), vx1 - vx0, pv['ZG'] - pv['ZD'],
+                             facecolor='#f39c12', edgecolor='#c0392b',
+                             alpha=0.18, lw=1.2, ls='--', zorder=1.5)
+        else:
+            rect = Rectangle((vx0, pv['ZD']), vx1 - vx0, pv['ZG'] - pv['ZD'],
+                             facecolor='#f39c12', edgecolor='#d35400',
+                             alpha=0.18, lw=1.2, zorder=1.5)
         ax.add_patch(rect)
         # 文本 x 位置也约束在可见区间内
         tx = (vx0 + vx1) / 2
-        ax.text(tx, pv['ZG'], f"中枢[{pv['ZD']:.0f},{pv['ZG']:.0f}]",
-                ha='center', va='bottom', fontsize=8, color='#7f4a00')
+        label = f"中枢[{pv['ZD']:.0f},{pv['ZG']:.0f}]"
+        if is_broken:
+            label += ' ✗跌破'
+        elif is_breakout:
+            label += ' ↑突破'
+        ax.text(tx, pv['ZG'], label,
+                ha='center', va='bottom', fontsize=8,
+                color='#c0392b' if (is_broken or is_breakout) else '#7f4a00')
+
+    # --- 破位反抽区（原文《教你炒股票 24-25/72/78》）---
+    # 对每个失败的 1B/1S，从破位那根 K 到迄今反抽极值之间画一个橙色底色带
+    # + 反抽极值处画一个空心圆 + 文字"破位反抽区(模式A/B/C)"。
+    _rebound_mode_zh = {
+        'weak': '模式A 弱反抽',
+        'standard': '模式B 标准反抽',
+        'fake_breakout': '模式C 疑似假破位',
+    }
+    _rebound_color = {
+        'weak': '#c0392b',        # 弱反抽 - 最差 - 红
+        'standard': '#e67e22',    # 标准反抽 - 橙
+        'fake_breakout': '#27ae60',  # 假破位 - 绿
+    }
+    from matplotlib.transforms import blended_transform_factory as _bxfy
+    for sig in list(buys) + list(sells):
+        if not sig.get('rebound_active'):
+            continue
+        fa = sig.get('failed_at')
+        ra = sig.get('rebound_at')
+        if fa is None or ra is None:
+            continue
+        # 破位/反抽极值可能在预热区外，也可能其中一个跑出可见窗
+        xa = orig_idx_map[fa] if fa < len(orig_idx_map) else fa
+        xb = orig_idx_map[ra] if ra < len(orig_idx_map) else ra
+        if max(xa, xb) < x_start:
+            continue
+        vx0 = max(min(xa, xb), x_start)
+        vx1 = min(max(xa, xb), x_end_all)
+        if vx1 <= vx0:
+            continue
+        mode = sig.get('rebound_mode', 'standard')
+        cc = _rebound_color.get(mode, '#e67e22')
+        # 用 blended：x=data, y=axes，画一条位于顶部的浅色条带（占 axes 5.5%~9.5%）
+        trans = _bxfy(ax.transData, ax.transAxes)
+        rect = Rectangle((vx0, 0.055), vx1 - vx0, 0.04,
+                         facecolor=cc, edgecolor=cc, alpha=0.28,
+                         lw=0, zorder=1.3, transform=trans)
+        ax.add_patch(rect)
+        # 反抽极值：画空心圆（数据坐标）
+        rebound_price = sig.get('rebound_price', sig['price'])
+        ax.scatter([xb], [rebound_price], marker='o', s=55,
+                   facecolors='none', edgecolors=cc, linewidths=1.6,
+                   zorder=7)
+        # 文字标注：破位反抽区 + 模式
+        tx = (vx0 + vx1) / 2
+        label = f'破位反抽区·{_rebound_mode_zh.get(mode, mode)}'
+        ax.text(tx, 0.075, label,
+                ha='center', va='center', fontsize=7.5,
+                color='white', fontweight='bold',
+                transform=trans, zorder=1.4,
+                bbox=dict(boxstyle='round,pad=0.15',
+                          facecolor=cc, edgecolor=cc, alpha=0.9))
 
     # --- 走势段 & 组合（原文《教你炒股票 17 / 100-108》）---
     if show_trend_moves and pivots:
@@ -1945,30 +2414,74 @@ def plot_chan(orig_df, mdf, fractals, strokes, segments, pivots, buys, sells,
     def _plot_visible(sig):
         return keep_by_idx.get(sig['idx'], (99, 0))[1] == id(sig)
 
+    def _decorate_failed(xi, price, is_buy):
+        """在失败信号位置画一个红叉，并用红色标注 ✗。"""
+        # 红叉：两条对角线（在 axes 数据坐标上，长度取当前 y 轴 0.8% 幅度）
+        ylim = ax.get_ylim()
+        dy = (ylim[1] - ylim[0]) * 0.008
+        ax.plot([xi - 0.9, xi + 0.9], [price - dy, price + dy],
+                color='#c0392b', lw=1.5, zorder=7)
+        ax.plot([xi - 0.9, xi + 0.9], [price + dy, price - dy],
+                color='#c0392b', lw=1.5, zorder=7)
+
     for b in buys:
         if not _plot_visible(b):
             continue
         xi = orig_idx_map[b['idx']]
         m, cc, sz = marker_map_buy[b['type']]
         a = _alpha(b['type'])
+        failed = bool(b.get('failed'))
+        invalidated = bool(b.get('invalidated'))
+        # 失败/撤销的信号视觉上弱化
+        if failed:
+            eff_a = 0.5
+            label_extra = '✗'
+            label_color = '#c0392b'
+        elif invalidated:
+            eff_a = 0.35
+            label_extra = '⊘'
+            label_color = '#7f8c8d'
+        else:
+            eff_a = a
+            label_extra = ''
+            label_color = cc
         ax.scatter([xi], [b['price']], marker=m, s=sz, color=cc,
-                   edgecolors='black', linewidths=0.6, zorder=6, alpha=a)
-        ax.annotate(b['type'], (xi, b['price']),
+                   edgecolors='black', linewidths=0.6, zorder=6, alpha=eff_a)
+        ax.annotate(f"{b['type']}{label_extra}", (xi, b['price']),
                     xytext=(0, -14), textcoords='offset points',
-                    ha='center', fontsize=8, color=cc, fontweight='bold',
-                    alpha=a)
+                    ha='center', fontsize=8, color=label_color, fontweight='bold',
+                    alpha=1.0 if (failed or invalidated) else a)
+        if failed:
+            _decorate_failed(xi, b['price'], is_buy=True)
+
     for s in sells:
         if not _plot_visible(s):
             continue
         xi = orig_idx_map[s['idx']]
         m, cc, sz = marker_map_sell[s['type']]
         a = _alpha(s['type'])
+        failed = bool(s.get('failed'))
+        invalidated = bool(s.get('invalidated'))
+        if failed:
+            eff_a = 0.5
+            label_extra = '✗'
+            label_color = '#c0392b'
+        elif invalidated:
+            eff_a = 0.35
+            label_extra = '⊘'
+            label_color = '#7f8c8d'
+        else:
+            eff_a = a
+            label_extra = ''
+            label_color = cc
         ax.scatter([xi], [s['price']], marker=m, s=sz, color=cc,
-                   edgecolors='black', linewidths=0.6, zorder=6, alpha=a)
-        ax.annotate(s['type'], (xi, s['price']),
+                   edgecolors='black', linewidths=0.6, zorder=6, alpha=eff_a)
+        ax.annotate(f"{s['type']}{label_extra}", (xi, s['price']),
                     xytext=(0, 10), textcoords='offset points',
-                    ha='center', fontsize=8, color=cc, fontweight='bold',
-                    alpha=a)
+                    ha='center', fontsize=8, color=label_color, fontweight='bold',
+                    alpha=1.0 if (failed or invalidated) else a)
+        if failed:
+            _decorate_failed(xi, s['price'], is_buy=False)
 
     ax.set_title(title, fontsize=14, fontweight='bold')
     ax.set_ylabel('价格')
@@ -2100,12 +2613,12 @@ def main():
     parser.add_argument('--display-start', default=None,
                         help='txt 数据源可选：只展示 >= 此日期的 K 线，之前作为预热段。'
                              '格式 YYYY-MM-DD。')
-    parser.add_argument('--recent-signals', type=int, default=10,
+    parser.add_argument('--recent-signals', type=int, default=5,
                         help='在图右侧显示最近 N 个买卖点的详细解释（含原文定义与'
                              '本次触发依据）。设 0 关闭。默认 5。')
     parser.add_argument('--recent-only-formal', action='store_true',
                         help='最近信号只显示正式买卖点（不含 1B?/2B?/1S?/2S? 等潜在点）。')
-    parser.add_argument('--hide-fractals', action='store_true',
+    parser.add_argument('--hide-fractals', action='store_false',
                         help='隐藏图上的顶/底分型箭头（橙色向下箭头=顶分型，蓝色向上箭头=底分型）。'
                              '默认显示；仅影响绘图，不影响笔/线段/中枢/买卖点的计算。')
     parser.add_argument('--hide-trend-moves', action='store_true',
@@ -2180,12 +2693,39 @@ def main():
     # 6. 买卖点
     buys, sells = find_buy_sell_points(strokes, pivots, mdf, orig_df)
     print(f"[买卖点] 买 {len(buys)}  卖 {len(sells)}")
+
+    # 6.5 失败检测 + 派生信号撤销 + 中枢延续修正
+    #     （原文《教你炒股票 72/78》：一买被跌破 → 结构错了 → 派生 2B 失效）
+    apply_signal_failure_pipeline(buys, sells, pivots, strokes, mdf, orig_df)
+    n_failed_b = sum(1 for b in buys if b.get('failed'))
+    n_failed_s = sum(1 for s in sells if s.get('failed'))
+    n_inv_b = sum(1 for b in buys if b.get('invalidated'))
+    n_inv_s = sum(1 for s in sells if s.get('invalidated'))
+    n_broken = sum(1 for pv in pivots if pv.get('broken'))
+    n_break_up = sum(1 for pv in pivots if pv.get('breakout'))
+    n_rb = sum(1 for x in list(buys) + list(sells) if x.get('rebound_active'))
+    if n_failed_b or n_failed_s or n_inv_b or n_inv_s or n_broken or n_break_up or n_rb:
+        print(f"[失败检测] 1B 失败 {n_failed_b} / 1S 失败 {n_failed_s}"
+              f"  2B 撤销 {n_inv_b} / 2S 撤销 {n_inv_s}"
+              f"  中枢跌破 {n_broken} / 中枢突破 {n_break_up}"
+              f"  破位反抽 {n_rb}")
+
     for b in buys:
         d = orig_df.loc[mdf['orig_idx'].values[b['idx']], 'time_key'].strftime('%Y-%m-%d')
-        print(f"  {b['type']} {d} @ {b['price']:.2f}  {b['note']}")
+        tag = ''
+        if b.get('failed'):
+            tag = f"  ✗ 失败@{b.get('failed_dt', '')}"
+        elif b.get('invalidated'):
+            tag = '  ⊘ 已撤销(前置 1B 失败)'
+        print(f"  {b['type']} {d} @ {b['price']:.2f}  {b['note']}{tag}")
     for s in sells:
         d = orig_df.loc[mdf['orig_idx'].values[s['idx']], 'time_key'].strftime('%Y-%m-%d')
-        print(f"  {s['type']} {d} @ {s['price']:.2f}  {s['note']}")
+        tag = ''
+        if s.get('failed'):
+            tag = f"  ✗ 失败@{s.get('failed_dt', '')}"
+        elif s.get('invalidated'):
+            tag = '  ⊘ 已撤销(前置 1S 失败)'
+        print(f"  {s['type']} {d} @ {s['price']:.2f}  {s['note']}{tag}")
 
     # 7. 绘图
     sub_strokes = build_sub_strokes(strokes, mdf, orig_df)
