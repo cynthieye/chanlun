@@ -1388,6 +1388,168 @@ def format_recent_signals_block(buys, sells, mdf, strokes, pivots, n=5,
     return out
 
 
+def segment_trend_moves(pivots, strokes):
+    """
+    把中枢序列切成"走势段"列表（原文《教你炒股票 17 走势终完美》）。
+
+    规则：
+      - 相邻中枢 relation='extension'（区间重叠）→ 同一"盘整块"（同一大中枢延伸）
+      - 相邻两个盘整块，若后块 ZD > 前块 ZG（阶梯升高）→ 合并为"上涨走势"
+      - 相邻两个盘整块，若后块 ZG < 前块 ZD（阶梯下降）→ 合并为"下跌走势"
+      - 否则各自独立作为"盘整"
+
+    走势段 dict 字段：
+      type         'up' / 'down' / 'flat'
+      pivots       该走势段包含的中枢下标列表（在 pivots 里的位置）
+      start_stroke 第一根笔的下标（相对 strokes）
+      end_stroke   最后一根笔的下标
+      note         简短原文级说明
+
+    return list[dict]，按时间正序。
+    """
+    if not pivots:
+        return []
+
+    # 1) 先按 extension 关系聚合成"盘整块"（同一大中枢的延伸）
+    blocks = []  # list of dict {pv_idxs, ZG, ZD, start_stroke, end_stroke}
+    cur = None
+    for pi, pv in enumerate(pivots):
+        if cur is None:
+            cur = {'pv_idxs': [pi], 'ZG': pv['ZG'], 'ZD': pv['ZD'],
+                   'start_stroke': pv['start_stroke'],
+                   'end_stroke': pv['end_stroke']}
+            continue
+        if pv.get('relation') == 'extension':
+            # 同一大中枢延伸：取更严格的 [max ZD, min ZG]？按原文延伸是"包含更多笔"，
+            # 这里合并区间用交集（更代表核心震荡区）
+            cur['pv_idxs'].append(pi)
+            cur['ZG'] = min(cur['ZG'], pv['ZG'])
+            cur['ZD'] = max(cur['ZD'], pv['ZD'])
+            cur['end_stroke'] = pv['end_stroke']
+        else:
+            blocks.append(cur)
+            cur = {'pv_idxs': [pi], 'ZG': pv['ZG'], 'ZD': pv['ZD'],
+                   'start_stroke': pv['start_stroke'],
+                   'end_stroke': pv['end_stroke']}
+    if cur is not None:
+        blocks.append(cur)
+
+    # 2) 相邻盘整块合并成上涨/下跌走势
+    moves = []
+    i = 0
+    while i < len(blocks):
+        b0 = blocks[i]
+        j = i + 1
+        run_type = None  # 'up' or 'down'
+        run_pvs = list(b0['pv_idxs'])
+        run_start = b0['start_stroke']
+        run_end = b0['end_stroke']
+        prev_zg, prev_zd = b0['ZG'], b0['ZD']
+        while j < len(blocks):
+            bj = blocks[j]
+            if bj['ZD'] > prev_zg:
+                dir_now = 'up'
+            elif bj['ZG'] < prev_zd:
+                dir_now = 'down'
+            else:
+                dir_now = None
+            if dir_now is None or (run_type is not None and dir_now != run_type):
+                break
+            run_type = dir_now
+            run_pvs.extend(bj['pv_idxs'])
+            run_end = bj['end_stroke']
+            prev_zg, prev_zd = bj['ZG'], bj['ZD']
+            j += 1
+        if run_type is None:
+            # 单块 → 盘整
+            moves.append({
+                'type': 'flat',
+                'pivots': run_pvs,
+                'start_stroke': run_start,
+                'end_stroke': run_end,
+                'note': f"盘整（1 个中枢震荡，{len(run_pvs)} 段延伸）"
+            })
+            i += 1
+        else:
+            moves.append({
+                'type': run_type,
+                'pivots': run_pvs,
+                'start_stroke': run_start,
+                'end_stroke': run_end,
+                'note': f"{'上涨' if run_type == 'up' else '下跌'}走势"
+                        f"（{len([p for p in run_pvs])} 中枢阶梯"
+                        f"{'升高' if run_type == 'up' else '降低'}）"
+            })
+            i = j
+    return moves
+
+
+def detect_move_combinations(moves):
+    """
+    在 moves 序列上滑动窗口识别六种走势组合（原文《教你炒股票 100-108》系列）：
+      陷阱式：上涨+下跌 / 下跌+上涨
+      反转式：上涨+盘整+下跌 / 下跌+盘整+上涨
+      中继式：上涨+盘整+上涨 / 下跌+盘整+下跌
+
+    return list[dict]：
+      {'kind': 'trap/reversal/continuation',
+       'pattern': 'up-down' / 'up-flat-down' / ...,
+       'label': '陷阱式 上涨→下跌'（中文），
+       'move_range': (i, j)  # 覆盖 moves[i..j]}
+    """
+    out = []
+    n = len(moves)
+
+    def _lbl_seq(seq):
+        m = {'up': '上涨', 'down': '下跌', 'flat': '盘整'}
+        return '→'.join(m[t] for t in seq)
+
+    # 三段先扫（覆盖反转/中继），已被三段覆盖的窗口不重复触发两段
+    used = [False] * n
+    for i in range(n - 2):
+        a, b, c = moves[i]['type'], moves[i+1]['type'], moves[i+2]['type']
+        seq = (a, b, c)
+        if b != 'flat':
+            continue
+        if seq == ('up', 'flat', 'down'):
+            out.append({'kind': 'reversal', 'pattern': 'up-flat-down',
+                        'label': f'反转式 {_lbl_seq(seq)}',
+                        'move_range': (i, i+2)})
+            used[i] = used[i+1] = used[i+2] = True
+        elif seq == ('down', 'flat', 'up'):
+            out.append({'kind': 'reversal', 'pattern': 'down-flat-up',
+                        'label': f'反转式 {_lbl_seq(seq)}',
+                        'move_range': (i, i+2)})
+            used[i] = used[i+1] = used[i+2] = True
+        elif seq == ('up', 'flat', 'up'):
+            out.append({'kind': 'continuation', 'pattern': 'up-flat-up',
+                        'label': f'中继式 {_lbl_seq(seq)}',
+                        'move_range': (i, i+2)})
+            used[i] = used[i+1] = used[i+2] = True
+        elif seq == ('down', 'flat', 'down'):
+            out.append({'kind': 'continuation', 'pattern': 'down-flat-down',
+                        'label': f'中继式 {_lbl_seq(seq)}',
+                        'move_range': (i, i+2)})
+            used[i] = used[i+1] = used[i+2] = True
+
+    # 两段扫（陷阱式：上涨+下跌 / 下跌+上涨，中间没有盘整）
+    for i in range(n - 1):
+        if used[i] or used[i+1]:
+            continue
+        a, b = moves[i]['type'], moves[i+1]['type']
+        if (a, b) == ('up', 'down'):
+            out.append({'kind': 'trap', 'pattern': 'up-down',
+                        'label': f'陷阱式 {_lbl_seq((a, b))}',
+                        'move_range': (i, i+1)})
+        elif (a, b) == ('down', 'up'):
+            out.append({'kind': 'trap', 'pattern': 'down-up',
+                        'label': f'陷阱式 {_lbl_seq((a, b))}',
+                        'move_range': (i, i+1)})
+
+    out.sort(key=lambda x: x['move_range'][0])
+    return out
+
+
 def interpret_market(orig_df, mdf, strokes, pivots, buys, sells):
     """
     基于《缠中说禅》原文（教你炒股票 17-25、63-84）生成当下走势解读文本。
@@ -1542,7 +1704,8 @@ def plot_chan(orig_df, mdf, fractals, strokes, segments, pivots, buys, sells,
               sub_strokes=None, display_start=None,
               title='恒生科技指数 HK.800700  缠论分析',
               n_recent_signals=5, recent_only_formal=False,
-              show_fractals=True):
+              show_fractals=True,
+              show_trend_moves=True):
     """
     display_start: pd.Timestamp 或 None
       若非 None，则只在 x 轴上显示 time_key >= display_start 的部分（预热段留给
@@ -1657,6 +1820,91 @@ def plot_chan(orig_df, mdf, fractals, strokes, segments, pivots, buys, sells,
         tx = (vx0 + vx1) / 2
         ax.text(tx, pv['ZG'], f"中枢[{pv['ZD']:.0f},{pv['ZG']:.0f}]",
                 ha='center', va='bottom', fontsize=8, color='#7f4a00')
+
+    # --- 走势段 & 组合（原文《教你炒股票 17 / 100-108》）---
+    if show_trend_moves and pivots:
+        moves = segment_trend_moves(pivots, strokes)
+        # 底部走势色带：轴的 axes 坐标 y 从 0 到 0.045
+        move_color = {'up': '#c0392b', 'down': '#16a085', 'flat': '#7f8c8d'}
+        move_label = {'up': '上涨', 'down': '下跌', 'flat': '盘整'}
+        # 拿 y 值：色带用 axes-fraction，避免遮挡 K 线
+        # 但矩形要落在 data 坐标系上定位 x，需要用 blended transform
+        from matplotlib.transforms import blended_transform_factory
+        trans = blended_transform_factory(ax.transData, ax.transAxes)
+        y_band_low, y_band_high = 0.0, 0.035  # axes 分数
+        for mv in moves:
+            s0 = strokes[mv['start_stroke']]
+            s1 = strokes[mv['end_stroke']]
+            x0 = orig_idx_map[s0['start_idx']]
+            x1 = orig_idx_map[s1['end_idx']]
+            # 完全在预热段：跳过；部分相交：裁剪
+            if x1 < x_start:
+                continue
+            vx0 = max(x0, x_start)
+            vx1 = min(x1, x_end_all)
+            if vx1 <= vx0:
+                continue
+            cc = move_color[mv['type']]
+            rect = Rectangle((vx0, y_band_low), vx1 - vx0,
+                             y_band_high - y_band_low,
+                             facecolor=cc, edgecolor=cc, alpha=0.55,
+                             lw=0, zorder=1.2, transform=trans)
+            ax.add_patch(rect)
+            tx = (vx0 + vx1) / 2
+            ax.text(tx, (y_band_low + y_band_high) / 2, move_label[mv['type']],
+                    ha='center', va='center', fontsize=8, color='white',
+                    fontweight='bold', transform=trans, zorder=1.3)
+
+        # 顶部组合标注：走势组合用括号 + 标签
+        combos = detect_move_combinations(moves)
+        combo_color = {'trap': '#8e44ad', 'reversal': '#d35400',
+                       'continuation': '#2980b9'}
+        # 组合叠加时按序错开 y 层
+        y_bracket_base = 0.965  # axes 分数（顶部）
+        layer_step = 0.028
+        # 按 move_range 排布避免重叠：简单贪心分层
+        occupied = []  # list of (x0, x1, layer)
+        for combo in combos:
+            i0, i1 = combo['move_range']
+            mv0 = moves[i0]
+            mv1 = moves[i1]
+            s_a = strokes[mv0['start_stroke']]
+            s_b = strokes[mv1['end_stroke']]
+            x0 = orig_idx_map[s_a['start_idx']]
+            x1 = orig_idx_map[s_b['end_idx']]
+            if x1 < x_start:
+                continue
+            vx0 = max(x0, x_start)
+            vx1 = min(x1, x_end_all)
+            if vx1 <= vx0:
+                continue
+            # 找一个不与已占用区间重叠的 layer
+            layer = 0
+            while True:
+                clash = any(l == layer and not (vx1 < a or vx0 > b)
+                            for (a, b, l) in occupied)
+                if not clash:
+                    break
+                layer += 1
+            occupied.append((vx0, vx1, layer))
+            y_lbl = y_bracket_base - layer * layer_step
+            y_bracket = y_lbl - 0.008
+            cc = combo_color[combo['kind']]
+            # 括号：水平线 + 两端向下的小 tick
+            ax.plot([vx0, vx1], [y_bracket, y_bracket],
+                    color=cc, lw=1.3, transform=trans, zorder=5)
+            tick_dy = 0.012
+            ax.plot([vx0, vx0], [y_bracket, y_bracket - tick_dy],
+                    color=cc, lw=1.3, transform=trans, zorder=5)
+            ax.plot([vx1, vx1], [y_bracket, y_bracket - tick_dy],
+                    color=cc, lw=1.3, transform=trans, zorder=5)
+            # 标签
+            tx = (vx0 + vx1) / 2
+            ax.text(tx, y_lbl, combo['label'],
+                    ha='center', va='bottom', fontsize=8.5, color=cc,
+                    fontweight='bold', transform=trans, zorder=6,
+                    bbox=dict(boxstyle='round,pad=0.2', facecolor='white',
+                              edgecolor=cc, alpha=0.85, lw=0.8))
 
     # --- 买卖点 ---
     marker_map_buy = {'1B': ('^', '#c0392b', 90),
@@ -1835,10 +2083,10 @@ def main():
                         help='数据源：txt 从本地文件读，futu 走 OpenD 拉取')
     parser.add_argument('--txt', default='长文本-1790229713.txt',
                         help='本地 txt 数据文件路径（source=txt 时使用）')
-    parser.add_argument('--stock', default='HK.00700',
+    parser.add_argument('--stock', default='HK.800700',
                         help='股票/指数代码（source=futu 时使用）')
     parser.add_argument('--start', default='2026-02-01')
-    parser.add_argument('--end',   default='2026-09-25')
+    parser.add_argument('--end',   default='2026-10-25')
     parser.add_argument('--ktype',
                         choices=['K_DAY', 'K_60M', 'K_120M', 'K_240M',
                                  'K_WEEK', 'K_MON'],
@@ -1860,6 +2108,9 @@ def main():
     parser.add_argument('--hide-fractals', action='store_true',
                         help='隐藏图上的顶/底分型箭头（橙色向下箭头=顶分型，蓝色向上箭头=底分型）。'
                              '默认显示；仅影响绘图，不影响笔/线段/中枢/买卖点的计算。')
+    parser.add_argument('--hide-trend-moves', action='store_true',
+                        help='隐藏底部走势色带（上涨/下跌/盘整）以及顶部走势组合标注（陷阱式/'
+                             '反转式/中继式）。默认显示；仅影响绘图。')
     args = parser.parse_args()
 
     display_start = None
@@ -1954,7 +2205,8 @@ def main():
                     display_start=display_start, title=title,
                     n_recent_signals=args.recent_signals,
                     recent_only_formal=args.recent_only_formal,
-                    show_fractals=not args.hide_fractals)
+                    show_fractals=not args.hide_fractals,
+                    show_trend_moves=not args.hide_trend_moves)
     out_png = args.out
     fig.savefig(out_png, dpi=140, bbox_inches='tight')
     print(f"[保存] {out_png}")
