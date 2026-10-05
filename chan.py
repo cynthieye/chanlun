@@ -2897,7 +2897,7 @@ def main():
                         help='数据源：txt 从本地文件读，futu 走 OpenD 拉取')
     parser.add_argument('--txt', default='长文本-1790229713.txt',
                         help='本地 txt 数据文件路径（source=txt 时使用）')
-    parser.add_argument('--stock', default='HK.01024',
+    parser.add_argument('--stock', default='HK.800700',
                         help='股票/指数代码（source=futu 时使用）')
     parser.add_argument('--start', default='2026-06-01')
     parser.add_argument('--end',   default='2026-10-23')
