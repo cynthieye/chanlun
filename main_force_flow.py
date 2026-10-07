@@ -134,75 +134,76 @@ def one_confirmation_per_candidate(
     return pd.Series(output, index=candidate.index)
 
 
+def mark_tdx_zone_extremes(
+    indicator: pd.Series,
+    high_threshold: float = 80,
+    low_threshold: float = 20,
+) -> tuple[pd.Series, pd.Series]:
+    """离开超买/超卖区后，将信号回绘到该区间的极值日期。"""
+    values = indicator.to_numpy(dtype=float)
+    low_signals = np.zeros(len(values), dtype=bool)
+    high_signals = np.zeros(len(values), dtype=bool)
+    high_zone: list[int] = []
+    low_zone: list[int] = []
+    for index, value in enumerate(values):
+        if not np.isfinite(value):
+            continue
+        if value >= high_threshold:
+            high_zone.append(index)
+        elif high_zone:
+            high_signals[max(high_zone, key=lambda item: values[item])] = True
+            high_zone = []
+        if value <= low_threshold:
+            low_zone.append(index)
+        elif low_zone:
+            low_signals[min(low_zone, key=lambda item: values[item])] = True
+            low_zone = []
+    return (
+        pd.Series(low_signals, index=indicator.index),
+        pd.Series(high_signals, index=indicator.index),
+    )
+
+
 # ============================================================================
-# 高抛低吸独立识别逻辑
+# 高抛低吸独立识别逻辑：通达信“高抛低吸（21,8）”
 # ============================================================================
-def calculate_buy_low_sell_high(data: pd.DataFrame) -> pd.DataFrame:
-    """高抛低吸：K/D交叉 + RSI + 趋势过滤 + 6日右侧确认。"""
+def calculate_buy_low_sell_high(
+    data: pd.DataFrame, n1: int = 21, n2: int = 8,
+) -> pd.DataFrame:
+    """复刻通达信高抛低吸核心公式，只输出低吸和高抛两个信号。"""
+    if n1 < 1 or n2 < 1:
+        raise ValueError("n1和n2必须大于等于1")
     result = data.sort_values("time_key").reset_index(drop=True).copy()
     for column in ["open", "close", "high", "low"]:
         result[column] = pd.to_numeric(result[column], errors="coerce")
     close, high, low = result["close"], result["high"], result["low"]
 
-    result["EMA10"] = close.ewm(span=10, adjust=False).mean()
-    result["EMA20"] = close.ewm(span=20, adjust=False).mean()
+    result["MA5"] = close.rolling(5, min_periods=5).mean()
+    result["MA10"] = close.rolling(10, min_periods=10).mean()
+    result["MA20"] = close.rolling(20, min_periods=20).mean()
     result["MA60"] = close.rolling(60, min_periods=60).mean()
-    result["MA120"] = close.rolling(120, min_periods=120).mean()
-    result["RSI14"] = calculate_rsi(close)
 
-    lowest = low.rolling(21, min_periods=21).min()
-    highest = high.rolling(21, min_periods=21).max()
-    rsv = ((close - lowest) / (highest - lowest).replace(0, np.nan) * 100).clip(0, 100)
-    result["K"] = tdx_sma(rsv, 3, 1)
-    result["D"] = tdx_sma(result["K"], 3, 1)
+    var8 = (2 * close + high + low) / 4
+    var9 = low.rolling(n1, min_periods=n1).min()
+    var10 = high.rolling(n2, min_periods=n2).max()
+    raw_position = (var8 - var9) / (var10 - var9).replace(0, np.nan) * 100
+    result["秘籍"] = raw_position.ewm(span=9, adjust=False, min_periods=1).mean()
+    explore_input = 0.667 * result["秘籍"].shift(1) + 0.333 * result["秘籍"]
+    result["探秘"] = explore_input.ewm(span=2, adjust=False, min_periods=1).mean()
 
-    macd = close.ewm(span=12, adjust=False).mean() - close.ewm(span=26, adjust=False).mean()
-    signal = macd.ewm(span=9, adjust=False).mean()
-    result["MACD柱"] = macd - signal
+    result["低吸原始"] = (
+        (result["秘籍"] > 20) & (result["秘籍"].shift(1) <= 20)
+    ).fillna(False)
+    result["高抛原始"] = (
+        (result["秘籍"] < 80) & (result["秘籍"].shift(1) >= 80)
+    ).fillna(False)
+    result["低吸"], result["高抛"] = mark_tdx_zone_extremes(result["秘籍"])
 
     previous_close = close.shift(1)
     true_range = pd.concat([
         high - low, (high - previous_close).abs(), (low - previous_close).abs()
     ], axis=1).max(axis=1)
     result["ATR14"] = true_range.ewm(alpha=1 / 14, adjust=False).mean()
-
-    cross_up = (result["K"] > result["D"]) & (result["K"].shift(1) <= result["D"].shift(1))
-    cross_down = (result["K"] < result["D"]) & (result["K"].shift(1) >= result["D"].shift(1))
-    ma60_slope = result["MA60"].pct_change(5)
-    low_trend_filter = (
-        (close > result["MA120"])
-        | (ma60_slope > -0.012)
-        | ((close > result["EMA20"]) & (result["MACD柱"].diff() > 0))
-    ).fillna(False)
-    high_trend_filter = (
-        (result["MACD柱"] < result["MACD柱"].shift(1))
-        | (close < result["EMA10"])
-        | (ma60_slope <= 0)
-    ).fillna(False)
-
-    result["低吸候选"] = (
-        cross_up & (result["K"] < 32) & (result["RSI14"] < 45) & low_trend_filter
-    ).fillna(False)
-    result["高抛候选"] = (
-        cross_down & (result["K"] > 68) & (result["RSI14"] > 55) & high_trend_filter
-    ).fillna(False)
-
-    price_cross_up = (close > result["EMA10"]) & (close.shift(1) <= result["EMA10"].shift(1))
-    price_cross_down = (close < result["EMA10"]) & (close.shift(1) >= result["EMA10"].shift(1))
-    macd_improving = result["MACD柱"] > result["MACD柱"].shift(1)
-    macd_weakening = result["MACD柱"] < result["MACD柱"].shift(1)
-    low_confirmation = price_cross_up & macd_improving & low_trend_filter
-    high_confirmation = price_cross_down | (macd_weakening & (result["K"] < 60))
-    result["低吸确认"] = one_confirmation_per_candidate(
-        result["低吸候选"], low_confirmation, 6
-    )
-    result["高抛确认"] = one_confirmation_per_candidate(
-        result["高抛候选"], high_confirmation, 6
-    )
-    # 高抛低吸副图强度：K、D、RSI共同描述0～100的短期位置。
-    result["高抛低吸强度"] = (
-        0.35 * result["K"] + 0.25 * result["D"] + 0.40 * result["RSI14"]
-    ).clip(0, 100)
     return result
 
 
@@ -363,7 +364,7 @@ def draw_candles(ax, data: pd.DataFrame) -> None:
 
 
 def draw_layered_flame(ax, x, values, colors, label: str) -> None:
-    """以高密度插值、轻微平滑和多层渐变绘制柔和火焰。"""
+    """以高密度插值、轻微平滑和多层渐变绘制火焰。"""
     y = np.asarray(values, dtype=float)
     x_num = mdates.date2num(pd.to_datetime(x))
     valid = np.isfinite(x_num) & np.isfinite(y)
@@ -429,6 +430,25 @@ def merge_nearby_signal_points(
     return ordered.loc[selected_indices].sort_values("time_key")
 
 
+def assign_same_day_stack(
+    signal_groups: list[pd.DataFrame],
+) -> list[pd.DataFrame]:
+    """为同一日K上的不同信号分配纵向层级，避免标记互相覆盖。"""
+    day_counts: dict[pd.Timestamp, int] = {}
+    stacked_groups: list[pd.DataFrame] = []
+    for points in signal_groups:
+        stacked = points.copy()
+        levels: list[int] = []
+        for value in pd.to_datetime(stacked["time_key"]):
+            day = pd.Timestamp(value).normalize()
+            level = day_counts.get(day, 0)
+            levels.append(level)
+            day_counts[day] = level + 1
+        stacked["_stack_level"] = levels
+        stacked_groups.append(stacked)
+    return stacked_groups
+
+
 def scatter_signal(
     ax, points: pd.DataFrame, y_column: str, atr_scale: float,
     marker: str, size: float, facecolor: str, edgecolor: str,
@@ -436,7 +456,13 @@ def scatter_signal(
 ) -> None:
     if points.empty:
         return
-    y = points[y_column] + points["ATR14"] * atr_scale
+    if "_stack_level" in points.columns:
+        # 同一日K上的多个信号统一放在K线下方，并按层级从上到下排列。
+        y = points["low"] - points["ATR14"] * (
+            0.45 + points["_stack_level"] * 0.55
+        )
+    else:
+        y = points[y_column] + points["ATR14"] * atr_scale
     ax.scatter(
         points["time_key"], y, marker=marker, s=size,
         facecolor=facecolor, edgecolor=edgecolor, linewidth=1.15,
@@ -471,11 +497,9 @@ def merge_results(
         "time_key", "open", "close", "high", "low", "volume", "turnover"
     ] if column in daily.columns]
     swing_fields = swing[[
-        "time_key", "K", "D", "RSI14", "MACD柱", "高抛低吸强度",
-        "低吸候选", "低吸确认", "高抛候选", "高抛确认",
+        "time_key", "秘籍", "探秘", "低吸原始", "高抛原始", "低吸", "高抛",
     ]].rename(columns={column: f"高抛低吸_{column}" for column in [
-        "K", "D", "RSI14", "MACD柱", "高抛低吸强度",
-        "低吸候选", "低吸确认", "高抛候选", "高抛确认",
+        "秘籍", "探秘", "低吸原始", "高抛原始", "低吸", "高抛",
     ]})
     extreme_fields = extreme[[
         "time_key", "区间位置", "底背离", "顶背离", "极端强度",
@@ -629,25 +653,14 @@ def plot_combined(
         gridspec_kw={"height_ratios": [3.6, 1.25], "hspace": 0.07},
     )
     draw_candles(ax, price)
-    ax.plot(swing_chart["time_key"], swing_chart["EMA10"], "#ffd54f", lw=1.0, label="EMA10")
-    ax.plot(swing_chart["time_key"], swing_chart["EMA20"], "#42a5f5", lw=0.9, label="EMA20")
-    ax.plot(swing_chart["time_key"], swing_chart["MA60"], "#ab47bc", lw=0.9, label="MA60")
-    ax.plot(swing_chart["time_key"], swing_chart["MA120"], "#eeeeee", lw=0.7,
-            alpha=0.65, label="MA120")
+    ax.plot(swing_chart["time_key"], swing_chart["MA5"], "#eeeeee", lw=0.9, label="MA5")
+    ax.plot(swing_chart["time_key"], swing_chart["MA10"], "#ffd54f", lw=1.0, label="MA10")
+    ax.plot(swing_chart["time_key"], swing_chart["MA20"], "#ab47bc", lw=1.0, label="MA20")
+    ax.plot(swing_chart["time_key"], swing_chart["MA60"], "#43a047", lw=0.9, label="MA60")
 
-    # 每一种候选/确认分别聚类；不同信号类型绝不互相合并。
-    low_candidates = merge_nearby_signal_points(
-        swing_chart[swing_chart["低吸候选"]], "low", "min"
-    )
-    low_confirmations = merge_nearby_signal_points(
-        swing_chart[swing_chart["低吸确认"]], "low", "min"
-    )
-    high_candidates = merge_nearby_signal_points(
-        swing_chart[swing_chart["高抛候选"]], "high", "max"
-    )
-    high_confirmations = merge_nearby_signal_points(
-        swing_chart[swing_chart["高抛确认"]], "high", "max"
-    )
+    # 通达信高抛低吸只保留“低吸”和“高抛”，不再绘制候选/确认。
+    low_signals = swing_chart[swing_chart["低吸"]]
+    high_signals = swing_chart[swing_chart["高抛"]]
     bottom_candidates = merge_nearby_signal_points(
         extreme_chart[extreme_chart["抄底候选"]], "low", "min"
     )
@@ -661,15 +674,35 @@ def plot_combined(
         extreme_chart[extreme_chart["逃顶确认"]], "high", "max"
     )
 
-    # 只绘制标记，不显示标记文字。
-    scatter_signal(ax, low_candidates, "low", -0.30,
-                   "o", 62, "#ffee58", "#ff8f00", "低吸候选", -20, False)
-    scatter_signal(ax, low_confirmations, "low", -0.60,
-                   "^", 135, "#ffca28", "#ff3d00", "低吸确认", -34, False)
-    scatter_signal(ax, high_candidates, "high", 0.30,
-                   "o", 62, "#64b5f6", "#0d47a1", "高抛候选", 20, False)
-    scatter_signal(ax, high_confirmations, "high", 0.60,
-                   "v", 135, "#42a5f5", "#002171", "高抛确认", -34, False)
+    (
+        low_signals,
+        high_signals,
+        bottom_candidates,
+        bottom_confirmations,
+        top_candidates,
+        top_confirmations,
+    ) = assign_same_day_stack([
+        low_signals,
+        high_signals,
+        bottom_candidates,
+        bottom_confirmations,
+        top_candidates,
+        top_confirmations,
+    ])
+    all_stacked_signals = pd.concat([
+        low_signals,
+        high_signals,
+        bottom_candidates,
+        bottom_confirmations,
+        top_candidates,
+        top_confirmations,
+    ], ignore_index=True)
+
+    # 只绘制标记，不显示标记文字；同一日的不同标记在K线下方纵向排列。
+    scatter_signal(ax, low_signals, "low", -0.55,
+                   "^", 145, "#ffeb3b", "#ff3d00", "低吸", -34, False)
+    scatter_signal(ax, high_signals, "high", 0.55,
+                   "v", 145, "#42a5f5", "#002171", "高抛", 34, False)
 
     scatter_signal(ax, bottom_candidates, "low", -0.92,
                    "s", 72, "#66bb6a", "#1b5e20", "抄底候选", -50, False)
@@ -709,8 +742,14 @@ def plot_combined(
     visible_low = float(price["low"].min())
     visible_high = float(price["high"].max())
     visible_range = max(visible_high - visible_low, abs(visible_high) * 0.01, 0.01)
+    signal_floor = visible_low
+    if not all_stacked_signals.empty:
+        stacked_y = all_stacked_signals["low"] - all_stacked_signals["ATR14"] * (
+            0.45 + all_stacked_signals["_stack_level"] * 0.55
+        )
+        signal_floor = float(stacked_y.min())
     ax.set_ylim(
-        visible_low - visible_range * 0.08,
+        min(visible_low - visible_range * 0.08, signal_floor - visible_range * 0.03),
         visible_high + visible_range * 0.32,
     )
     ax.legend(loc="upper left", ncol=4, fontsize=8)
@@ -733,11 +772,15 @@ def plot_combined(
 def main() -> None:
     parser = argparse.ArgumentParser(description="高抛低吸与抄底逃顶单文件联合版")
     parser.add_argument("--code", default="HK.800700", help="富途证券代码")
-    parser.add_argument("--start", default="2025-01-02", help="图片开始日期")
-    parser.add_argument("--end", default=pd.Timestamp.today().strftime("%Y-%m-%d"),
+    parser.add_argument("--start", default="2025-09-02", help="图片开始日期")
+    parser.add_argument("--end",
+                        # default="2023-01-02", 
+                        default=pd.Timestamp.today().strftime("%Y-%m-%d"),
                         help="图片结束日期，默认今天")
     parser.add_argument("--warmup-days", type=int, default=365,
                         help="start之前额外拉取的自然日数，默认365")
+    parser.add_argument("--n1", type=int, default=21, help="通达信高抛低吸N1，默认21")
+    parser.add_argument("--n2", type=int, default=8, help="通达信高抛低吸N2，默认8")
     parser.add_argument("--main-force-period", type=int, default=34,
                         help="主力吸筹/出货阶段新高新低观察周期，默认34")
     parser.add_argument("--host", default="127.0.0.1", help="Futu OpenD地址")
@@ -758,7 +801,9 @@ def main() -> None:
         host=args.host, port=args.port,
     )
     # 两套识别函数独立执行，只共享同一份原始日K。
-    swing_result = calculate_buy_low_sell_high(daily.copy())
+    swing_result = calculate_buy_low_sell_high(
+        daily.copy(), n1=args.n1, n2=args.n2
+    )
     extreme_result = calculate_bottom_top_escape(daily.copy())
     main_force_result = calculate_main_force_flow(
         daily.copy(), period=args.main_force_period
@@ -769,10 +814,8 @@ def main() -> None:
     print(f"Futu拉取区间：{fetch_start}～{args.end}（预热{args.warmup_days}天）")
     print(f"联合数据：{args.csv}")
     print(
-        f"高抛低吸：低吸候选{int(merged['高抛低吸_低吸候选'].sum())}、"
-        f"低吸确认{int(merged['高抛低吸_低吸确认'].sum())}、"
-        f"高抛候选{int(merged['高抛低吸_高抛候选'].sum())}、"
-        f"高抛确认{int(merged['高抛低吸_高抛确认'].sum())}"
+        f"高抛低吸：低吸{int(merged['高抛低吸_低吸'].sum())}、"
+        f"高抛{int(merged['高抛低吸_高抛'].sum())}"
     )
     print(
         f"抄底逃顶：抄底候选{int(merged['抄底逃顶_抄底候选'].sum())}、"
