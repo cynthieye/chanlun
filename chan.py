@@ -1436,7 +1436,7 @@ def rectify_pivots_by_failure(pivots, strokes, mdf, buys, sells):
     return pivots
 
 
-def detect_break_rebounds(buys, sells, mdf, window_bars=20,
+def detect_break_rebounds(buys, sells, mdf, orig_df, window_bars=20,
                           weak_threshold=0.995,
                           fake_threshold=1.005):
     """
@@ -1462,25 +1462,36 @@ def detect_break_rebounds(buys, sells, mdf, window_bars=20,
       sig['rebound_from']      破位那根 K 索引（= failed_at）
       sig['rebound_window']    实际扫描到的 K 数（可能 < window_bars 因为数据到最新为止）
     """
-    lows = mdf['low'].values
-    highs = mdf['high'].values
-    n = len(mdf)
+    # 破位、收复和再次破位必须基于原始 K 线判断；包含处理后的 mdf
+    # 可能把 10-08 与 10-09 合并，并错误沿用 10-09 的日期。
+    lows = orig_df['low'].values
+    highs = orig_df['high'].values
+    n = len(orig_df)
+    orig_idx_map = mdf['orig_idx'].values.astype(int)
+
+    def _to_merged_idx(orig_idx):
+        """原始 K 索引映射到合并 K 索引，仅供现有绘图逻辑兼容使用。"""
+        k = int(np.searchsorted(orig_idx_map, int(orig_idx), side='left'))
+        return min(k, len(mdf) - 1)
 
     def _classify_rebound(sig, is_buy):
         if not sig.get('failed'):
             return
-        fa = sig.get('failed_at')
-        if fa is None:
-            return
+        fa_orig = sig.get('failed_orig_idx')
+        if fa_orig is None:
+            fa = sig.get('failed_at')
+            if fa is None:
+                return
+            fa_orig = int(orig_idx_map[int(fa)])
         price = float(sig['price'])
 
         # 若第一次破位后曾越过关键位，随后又再次破位，则前一轮“疑似假破位”
         # 已经结束，必须从最近一次重新破位处开启新的反抽周期。否则历史最高/最低
         # 会永久把模式锁死在 C，无法反映当下已经再次向下/向上破位的状态。
-        effective_fa = int(fa)
+        effective_fa_orig = int(fa_orig)
         if is_buy:
             reclaim_line = price * fake_threshold
-            cursor = effective_fa + 1
+            cursor = effective_fa_orig + 1
             while cursor < n:
                 reclaim_rel = np.flatnonzero(highs[cursor:] > reclaim_line)
                 if len(reclaim_rel) == 0:
@@ -1489,11 +1500,11 @@ def detect_break_rebounds(buys, sells, mdf, window_bars=20,
                 rebreak_rel = np.flatnonzero(lows[reclaim_at + 1:] < price)
                 if len(rebreak_rel) == 0:
                     break
-                effective_fa = reclaim_at + 1 + int(rebreak_rel[0])
-                cursor = effective_fa + 1
+                effective_fa_orig = reclaim_at + 1 + int(rebreak_rel[0])
+                cursor = effective_fa_orig + 1
         else:
             reclaim_line = price * (2 - fake_threshold)
-            cursor = effective_fa + 1
+            cursor = effective_fa_orig + 1
             while cursor < n:
                 reclaim_rel = np.flatnonzero(lows[cursor:] < reclaim_line)
                 if len(reclaim_rel) == 0:
@@ -1502,14 +1513,16 @@ def detect_break_rebounds(buys, sells, mdf, window_bars=20,
                 rebreak_rel = np.flatnonzero(highs[reclaim_at + 1:] > price)
                 if len(rebreak_rel) == 0:
                     break
-                effective_fa = reclaim_at + 1 + int(rebreak_rel[0])
-                cursor = effective_fa + 1
+                effective_fa_orig = reclaim_at + 1 + int(rebreak_rel[0])
+                cursor = effective_fa_orig + 1
 
-        sig['rebreak_at'] = effective_fa if effective_fa != int(fa) else None
+        is_rebreak = effective_fa_orig != int(fa_orig)
+        sig['rebreak_orig_idx'] = effective_fa_orig if is_rebreak else None
+        sig['rebreak_at'] = _to_merged_idx(effective_fa_orig) if is_rebreak else None
 
-        # 反抽必须发生在本轮最近一次破位之后。日 K 无法知道同一根 K 内
-        # high 和 low 的先后顺序，所以破位当根 K 只用于确认破位。
-        start = effective_fa + 1
+        # 反抽周期从破位后的下一根原始 K 开始；日期表示“反抽开始日”，
+        # rebound_price 则表示从开始日至今达到的反抽极值。
+        start = effective_fa_orig + 1
         end = min(n, start + window_bars)
         sig['rebound_from'] = start
         sig['rebound_window'] = max(0, end - start)
@@ -1549,7 +1562,9 @@ def detect_break_rebounds(buys, sells, mdf, window_bars=20,
                 mode = 'standard'
 
         sig['rebound_active'] = True
-        sig['rebound_at'] = int(start + k_off)
+        rebound_orig_idx = int(start + k_off)
+        sig['rebound_orig_idx'] = rebound_orig_idx
+        sig['rebound_at'] = _to_merged_idx(rebound_orig_idx)
         sig['rebound_price'] = rebound
         sig['rebound_mode'] = mode
 
@@ -1568,7 +1583,7 @@ def apply_signal_failure_pipeline(buys, sells, pivots, strokes, mdf, orig_df):
     detect_failed_signals(buys, sells, mdf, orig_df)
     cascade_invalidate_derived_signals(buys, sells)
     rectify_pivots_by_failure(pivots, strokes, mdf, buys, sells)
-    detect_break_rebounds(buys, sells, mdf)
+    detect_break_rebounds(buys, sells, mdf, orig_df)
     return buys, sells, pivots
 
 
@@ -2039,6 +2054,36 @@ def interpret_market(orig_df, mdf, strokes, pivots, buys, sells,
             # 中枢内
             pos_in = (last_close - zd) / (zg - zd) * 100 if zg > zd else 50
             lines.append(f'· 位置态: 收盘 {last_close:.2f} 位于中枢内（相对下沿 {pos_in:.2f}%）')
+
+            # 不只描述“现在在中枢内”，还要识别最近一根 K 是否刚从中枢外
+            # 重新收回中枢。否则像 10-08 收盘跌破、10-09 收盘站回的关键
+            # 状态切换，会被静态的“中枢震荡”描述掩盖。
+            if len(orig_df) >= 2:
+                prev_close = float(orig_df['close'].iloc[-2])
+                prev_date = orig_df['time_key'].iloc[-2]
+                if prev_close < zd:
+                    lines.append(
+                        f'  【中枢回归】 {_fmt_ts(prev_date, style="full")} 收盘 '
+                        f'{prev_close:.2f} 曾跌破 ZD={zd:.2f}，'
+                        f'{last_date_str} 收盘 {last_close:.2f} 已重新站回中枢 '
+                        f'[{zd:.2f}, {zg:.2f}]'
+                    )
+                    lines.append(
+                        '  ▸ 按收盘口径，本次向下离开未形成有效三卖，先按中枢延伸/扩展处理；'
+                        f'后续若再次收盘跌破 {zd:.2f}，再观察反抽能否站回'
+                    )
+                elif prev_close > zg:
+                    lines.append(
+                        f'  【中枢回归】 {_fmt_ts(prev_date, style="full")} 收盘 '
+                        f'{prev_close:.2f} 曾突破 ZG={zg:.2f}，'
+                        f'{last_date_str} 收盘 {last_close:.2f} 已重新跌回中枢 '
+                        f'[{zd:.2f}, {zg:.2f}]'
+                    )
+                    lines.append(
+                        '  ▸ 按收盘口径，本次向上离开未形成有效三买，先按中枢延伸/扩展处理；'
+                        f'后续若再次收盘突破 {zg:.2f}，再观察回抽是否跌回'
+                    )
+
             lines.append('  【中枢震荡】按原文：')
             lines.append(f'  ▸ 近 ZG {zg:.2f} → 逢高减，等破位方向；近 ZD {zd:.2f} → 逢低加')
             lines.append('  ▸ 中枢完成 9 段（每次进出算一段）后进入延伸判定；关注是否有力度不衰减的向上或向下离开笔')
@@ -2210,14 +2255,31 @@ def interpret_market(orig_df, mdf, strokes, pivots, buys, sells,
             'fake_breakout': '模式C 疑似假破位',
         }.get(mode, mode)
         try:
-            effective_break_at = (latest_rb.get('rebreak_at')
-                                  if latest_rb.get('rebreak_at') is not None
-                                  else latest_rb.get('failed_at'))
-            d_fail = _fmt_ts(mdf['time_key'].iloc[effective_break_at],
-                             style='short')
-            d_reb = _fmt_ts(mdf['time_key'].iloc[latest_rb['rebound_at']],
-                            style='short')
+            # 破位日期取原始 K；不能使用包含处理后的 mdf 日期。
+            effective_break_orig = (latest_rb.get('rebreak_orig_idx')
+                                    if latest_rb.get('rebreak_orig_idx') is not None
+                                    else latest_rb.get('failed_orig_idx'))
+            if effective_break_orig is not None:
+                d_fail = _fmt_ts(orig_df['time_key'].iloc[int(effective_break_orig)],
+                                 style='short')
+            else:
+                effective_break_at = (latest_rb.get('rebreak_at')
+                                      if latest_rb.get('rebreak_at') is not None
+                                      else latest_rb.get('failed_at'))
+                d_fail = _fmt_ts(mdf['time_key'].iloc[effective_break_at],
+                                 style='short')
+
+            # 这里展示的是“本轮反抽开始日期”，而不是反抽最高/最低价
+            # 恰好出现在哪一天。例如 10-09 开始反抽，10-12 盘中把
+            # 本轮最高点更新至 30.44，应显示“10-09 反抽至 30.44”。
+            rebound_from_orig = latest_rb.get('rebound_from')
+            if rebound_from_orig is not None:
+                d_reb = _fmt_ts(orig_df['time_key'].iloc[int(rebound_from_orig)],
+                                style='short')
+            else:
+                d_reb = '?'
         except Exception:
+            d_fail = '?'
             d_reb = '?'
         p_fail = latest_rb['price']
         p_reb = latest_rb.get('rebound_price', p_fail)
@@ -2917,7 +2979,7 @@ def main():
     parser.add_argument('--txt', default='长文本-1790229713.txt',
                         help='本地 txt 数据文件路径（source=txt 时使用）')
     parser.add_argument('--stock', 
-                        default='HK.01024',
+                        default='HK.09660',
                         # default='SH.603986',
                         help='股票/指数代码（source=futu 时使用）')
     parser.add_argument('--start', default='2025-08-01')
