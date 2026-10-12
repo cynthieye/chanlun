@@ -1263,22 +1263,32 @@ def detect_failed_signals(buys, sells, mdf, orig_df,
 
     直接在原 dict 上原地写入：
       sig['failed']    = True/False
-      sig['failed_at'] = 触发失败的 K 索引（mdf 索引）
-      sig['failed_dt'] = 触发失败的日期字符串
-      sig['failed_by'] = 'break_1b_low' / 'break_1s_high'
+      sig['failed_at']       = 触发失败位置对应的 mdf 索引（兼容后续逻辑）
+      sig['failed_orig_idx'] = 触发失败的原始 K 线索引
+      sig['failed_dt']       = 触发失败的日期字符串
+      sig['failed_price']    = 跌破时最低价 / 升破时最高价
+      sig['failed_by']       = 'break_1b_low' / 'break_1s_high'
 
     return (buys, sells)  # 同引用，方便链式调用
     """
-    lows = mdf['low'].values
-    highs = mdf['high'].values
-    n = len(mdf)
+    # 失败时间必须在原始K线上检测。包含关系合并后的 mdf 可能把 10-08
+    # 合并并记到 10-09，从而造成失败日期晚一天。
+    orig_lows = orig_df['low'].values
+    orig_highs = orig_df['high'].values
+    orig_idx_map = mdf['orig_idx'].values.astype(int)
+    orig_n = len(orig_df)
 
-    def _mark_failed(sig, at_idx, kind):
+    def _mark_failed(sig, orig_at_idx, kind, break_price):
         sig['failed'] = True
-        sig['failed_at'] = int(at_idx)
+        sig['failed_orig_idx'] = int(orig_at_idx)
+        sig['failed_price'] = float(break_price)
+        # failed_at 保留为 mdf 索引，兼容后续反抽检测和既有接口。
+        merged_at = int(np.searchsorted(orig_idx_map, orig_at_idx, side='left'))
+        sig['failed_at'] = min(merged_at, len(mdf) - 1)
         sig['failed_by'] = kind
         try:
-            sig['failed_dt'] = _fmt_ts(mdf['time_key'].iloc[at_idx], style='full')
+            sig['failed_dt'] = _fmt_ts(
+                orig_df['time_key'].iloc[orig_at_idx], style='full')
         except Exception:
             sig['failed_dt'] = ''
 
@@ -1287,12 +1297,13 @@ def detect_failed_signals(buys, sells, mdf, orig_df,
         if base != '1B':
             b.setdefault('failed', False)
             continue
-        start_idx = int(b['idx']) + 1  # 从触发点下一根开始查
+        # 信号 idx 是 mdf 索引，转换到原始K线后从下一根开始检测。
+        start_orig_idx = int(orig_idx_map[int(b['idx'])]) + 1
         limit = float(b['price']) - break_tolerance
         found = False
-        for k in range(start_idx, n):
-            if lows[k] < limit:
-                _mark_failed(b, k, 'break_1b_low')
+        for k in range(start_orig_idx, orig_n):
+            if orig_lows[k] < limit:
+                _mark_failed(b, k, 'break_1b_low', orig_lows[k])
                 found = True
                 break
         if not found:
@@ -1303,12 +1314,12 @@ def detect_failed_signals(buys, sells, mdf, orig_df,
         if base != '1S':
             s.setdefault('failed', False)
             continue
-        start_idx = int(s['idx']) + 1
+        start_orig_idx = int(orig_idx_map[int(s['idx'])]) + 1
         limit = float(s['price']) + break_tolerance
         found = False
-        for k in range(start_idx, n):
-            if highs[k] > limit:
-                _mark_failed(s, k, 'break_1s_high')
+        for k in range(start_orig_idx, orig_n):
+            if orig_highs[k] > limit:
+                _mark_failed(s, k, 'break_1s_high', orig_highs[k])
                 found = True
                 break
         if not found:
@@ -1714,14 +1725,18 @@ def explain_signal(sig, mdf, strokes, pivots, all_buys=None, all_sells=None):
     if sig.get('failed'):
         d_fail = sig.get('failed_dt', '?')
         p_key = sig['price']
+        p_break = sig.get('failed_price')
         if base_type == '1B':
-            lines.append(f'  [失败] {d_fail} 跌破本低点 {p_key:.2f} → '
+            price_text = f'，最低至 {p_break:.2f}' if p_break is not None else ''
+            lines.append(f'  [失败] {d_fail} 跌破本低点 {p_key:.2f}{price_text} → '
                          f'一买失败（原文 78：止损为唯一动作）')
         elif base_type == '1S':
-            lines.append(f'  [失败] {d_fail} 升破本高点 {p_key:.2f} → '
+            price_text = f'，最高至 {p_break:.2f}' if p_break is not None else ''
+            lines.append(f'  [失败] {d_fail} 升破本高点 {p_key:.2f}{price_text} → '
                          f'一卖失败（原文 78：止盈为唯一动作）')
         else:
-            lines.append(f'  [失败] {d_fail} 关键位 {p_key:.2f} 被击穿')
+            price_text = f'，触及 {p_break:.2f}' if p_break is not None else ''
+            lines.append(f'  [失败] {d_fail} 关键位 {p_key:.2f} 被击穿{price_text}')
     elif sig.get('invalidated'):
         lines.append('  [撤销] 前置一买/一卖已失败 → 本派生信号自动作废')
 
@@ -2103,9 +2118,11 @@ def interpret_market(orig_df, mdf, strokes, pivots, buys, sells,
                       key=lambda x: (x.get('failed_at', 0), x['idx']))
         d0 = _sig_date(last_fb)
         d1 = last_fb.get('failed_dt', '?')
+        p1 = last_fb.get('failed_price')
+        price_text = f'，最低至 {p1:.2f}' if p1 is not None else ''
         lines.append(
             f'⚠ 一买失败告警: {last_fb["type"]} {d0} @ {last_fb["price"]:.2f} '
-            f'已于 {d1} 被跌破'
+            f'已于 {d1} 被跌破{price_text}'
         )
         lines.append('  ▸ 原文《教你炒股票 78》: 止损为唯一动作；此为"背驰段的再背驰"，'
                      '空仓等新的日线级别底背驰或周线级别背驰')
@@ -2114,9 +2131,11 @@ def interpret_market(orig_df, mdf, strokes, pivots, buys, sells,
                       key=lambda x: (x.get('failed_at', 0), x['idx']))
         d0 = _sig_date(last_fs)
         d1 = last_fs.get('failed_dt', '?')
+        p1 = last_fs.get('failed_price')
+        price_text = f'，最高至 {p1:.2f}' if p1 is not None else ''
         lines.append(
             f'⚠ 一卖失败告警: {last_fs["type"]} {d0} @ {last_fs["price"]:.2f} '
-            f'已于 {d1} 被升破'
+            f'已于 {d1} 被升破{price_text}'
         )
         lines.append('  ▸ 原文《教你炒股票 78》: 止盈为唯一动作；'
                      '此为"背驰段的再背驰"，空仓等新的日线级别顶背驰')
@@ -2897,10 +2916,12 @@ def main():
                         help='数据源：txt 从本地文件读，futu 走 OpenD 拉取')
     parser.add_argument('--txt', default='长文本-1790229713.txt',
                         help='本地 txt 数据文件路径（source=txt 时使用）')
-    parser.add_argument('--stock', default='HK.800700',
+    parser.add_argument('--stock', 
+                        default='HK.01024',
+                        # default='SH.603986',
                         help='股票/指数代码（source=futu 时使用）')
-    parser.add_argument('--start', default='2026-06-01')
-    parser.add_argument('--end',   default='2026-10-23')
+    parser.add_argument('--start', default='2025-08-01')
+    parser.add_argument('--end',   default='2026-10-24')
     parser.add_argument('--ktype',
                         choices=['K_DAY', 'K_60M', 'K_120M', 'K_240M',
                                  'K_WEEK', 'K_MON'],
@@ -3015,7 +3036,9 @@ def main():
         d = orig_df.loc[mdf['orig_idx'].values[b['idx']], 'time_key'].strftime('%Y-%m-%d')
         tag = ''
         if b.get('failed'):
-            tag = f"  ✗ 失败@{b.get('failed_dt', '')}"
+            p = b.get('failed_price')
+            suffix = f" 最低至{p:.2f}" if p is not None else ''
+            tag = f"  ✗ 失败@{b.get('failed_dt', '')}{suffix}"
         elif b.get('invalidated'):
             tag = '  ⊘ 已撤销(前置 1B 失败)'
         print(f"  {b['type']} {d} @ {b['price']:.2f}  {b['note']}{tag}")
@@ -3023,7 +3046,9 @@ def main():
         d = orig_df.loc[mdf['orig_idx'].values[s['idx']], 'time_key'].strftime('%Y-%m-%d')
         tag = ''
         if s.get('failed'):
-            tag = f"  ✗ 失败@{s.get('failed_dt', '')}"
+            p = s.get('failed_price')
+            suffix = f" 最高至{p:.2f}" if p is not None else ''
+            tag = f"  ✗ 失败@{s.get('failed_dt', '')}{suffix}"
         elif s.get('invalidated'):
             tag = '  ⊘ 已撤销(前置 1S 失败)'
         print(f"  {s['type']} {d} @ {s['price']:.2f}  {s['note']}{tag}")
