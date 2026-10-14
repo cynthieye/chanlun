@@ -776,6 +776,15 @@ def find_buy_sell_points(strokes, pivots, mdf: pd.DataFrame, orig_df: pd.DataFra
             return '盘整'
         return '趋势'
 
+    def _has_area(area, eps=1e-12):
+        """对应方向必须真实出现过 MACD 柱，不能把“面积为 0”当成力度衰减。
+
+        下跌背驰要求 A、C 两段都至少出现过绿柱面积；上涨背驰对称要求
+        A、C 两段都至少出现过红柱面积。否则没有同方向面积可比，不能
+        生成正式 1B/1S。
+        """
+        return np.isfinite(area) and area > eps
+
     for i in range(2, len(strokes)):
         a = strokes[i-2]; c = strokes[i]
         if a['direction'] != c['direction']:
@@ -795,14 +804,18 @@ def find_buy_sell_points(strokes, pivots, mdf: pd.DataFrame, orig_df: pd.DataFra
             new_low = c['end_price'] < a['end_price']
             near_low = (c['end_price'] <= a['end_price'] * 1.03  # 距离 a 低点不超过 3%
                         and c['end_price'] >= a['end_price'] * 0.90)  # 也不能低太多（那样是新低场景）
-            if new_low and macd_valid and pc_neg < pa_neg * 0.95:
+            if (new_low and macd_valid
+                    and _has_area(pa_neg) and _has_area(pc_neg)
+                    and pc_neg < pa_neg * 0.95):
                 dedup_append(buys, {
                     'type': '1B', 'idx': c['end_idx'],
                     'price': c['end_price'],
                     'note': f'{kind}背驰底(MACD面积 {pc_neg:.2f}<{pa_neg:.2f})',
                     'stroke_i': i,
                 })
-            elif near_low and macd_valid and pc_neg < pa_neg * 0.6 and pa_neg > 20:
+            elif (near_low and macd_valid
+                  and _has_area(pa_neg) and _has_area(pc_neg)
+                  and pc_neg < pa_neg * 0.6 and pa_neg > 20):
                 dedup_append(buys, {
                     'type': '1B', 'idx': c['end_idx'],
                     'price': c['end_price'],
@@ -813,14 +826,18 @@ def find_buy_sell_points(strokes, pivots, mdf: pd.DataFrame, orig_df: pd.DataFra
             new_high = c['end_price'] > a['end_price']
             near_high = (c['end_price'] >= a['end_price'] * 0.97
                          and c['end_price'] <= a['end_price'] * 1.10)
-            if new_high and macd_valid and pc_pos < pa_pos * 0.95:
+            if (new_high and macd_valid
+                    and _has_area(pa_pos) and _has_area(pc_pos)
+                    and pc_pos < pa_pos * 0.95):
                 dedup_append(sells, {
                     'type': '1S', 'idx': c['end_idx'],
                     'price': c['end_price'],
                     'note': f'{kind}背驰顶(MACD面积 {pc_pos:.2f}<{pa_pos:.2f})',
                     'stroke_i': i,
                 })
-            elif near_high and macd_valid and pc_pos < pa_pos * 0.6 and pa_pos > 20:
+            elif (near_high and macd_valid
+                  and _has_area(pa_pos) and _has_area(pc_pos)
+                  and pc_pos < pa_pos * 0.6 and pa_pos > 20):
                 dedup_append(sells, {
                     'type': '1S', 'idx': c['end_idx'],
                     'price': c['end_price'],
@@ -843,7 +860,9 @@ def find_buy_sell_points(strokes, pivots, mdf: pd.DataFrame, orig_df: pd.DataFra
             pa_pos, pa_neg = macd_area(macdh, a0, a1)
             pc_pos, pc_neg = macd_area(macdh, c0, c1)
             if end_s['direction'] == 'down':
-                if end_s['end_price'] < A['end_price'] and pa_neg > 5 and pc_neg < pa_neg * 0.95:
+                if (end_s['end_price'] < A['end_price']
+                        and _has_area(pa_neg) and _has_area(pc_neg)
+                        and pa_neg > 5 and pc_neg < pa_neg * 0.95):
                     dedup_append(buys, {
                         'type': '1B', 'idx': end_s['end_idx'],
                         'price': end_s['end_price'],
@@ -851,7 +870,9 @@ def find_buy_sell_points(strokes, pivots, mdf: pd.DataFrame, orig_df: pd.DataFra
                         'stroke_i': s2,
                     })
             else:
-                if end_s['end_price'] > A['end_price'] and pa_pos > 5 and pc_pos < pa_pos * 0.95:
+                if (end_s['end_price'] > A['end_price']
+                        and _has_area(pa_pos) and _has_area(pc_pos)
+                        and pa_pos > 5 and pc_pos < pa_pos * 0.95):
                     dedup_append(sells, {
                         'type': '1S', 'idx': end_s['end_idx'],
                         'price': end_s['end_price'],
@@ -890,7 +911,9 @@ def find_buy_sell_points(strokes, pivots, mdf: pd.DataFrame, orig_df: pd.DataFra
         pa_pos, pa_neg = macd_area(macdh, a0, a1)
         pc_pos, pc_neg = macd_area(macdh, c0, c1)
         if dirn == 'down':
-            if end_curr['end_price'] < A_prev['end_price'] and pa_neg > 5 and pc_neg < pa_neg * 0.95:
+            if (end_curr['end_price'] < A_prev['end_price']
+                    and _has_area(pa_neg) and _has_area(pc_neg)
+                    and pa_neg > 5 and pc_neg < pa_neg * 0.95):
                 dedup_append(buys, {
                     'type': '1B', 'idx': end_curr['end_idx'],
                     'price': end_curr['end_price'],
@@ -898,7 +921,9 @@ def find_buy_sell_points(strokes, pivots, mdf: pd.DataFrame, orig_df: pd.DataFra
                     'stroke_i': pv_curr['end_stroke'],
                 })
         else:
-            if end_curr['end_price'] > A_prev['end_price'] and pa_pos > 5 and pc_pos < pa_pos * 0.95:
+            if (end_curr['end_price'] > A_prev['end_price']
+                    and _has_area(pa_pos) and _has_area(pc_pos)
+                    and pa_pos > 5 and pc_pos < pa_pos * 0.95):
                 dedup_append(sells, {
                     'type': '1S', 'idx': end_curr['end_idx'],
                     'price': end_curr['end_price'],
@@ -956,7 +981,8 @@ def find_buy_sell_points(strokes, pivots, mdf: pd.DataFrame, orig_df: pd.DataFra
         pc_pos, pc_neg = macd_area(macdh, c0, c1)
         if dirn == 'down':
             new_low = leave_s['end_price'] < enter_s['end_price']
-            if new_low and pa_neg > 5 and pc_neg < pa_neg * 0.95:
+            if (new_low and _has_area(pa_neg) and _has_area(pc_neg)
+                    and pa_neg > 5 and pc_neg < pa_neg * 0.95):
                 dedup_append(buys, {
                     'type': '1B', 'idx': leave_s['end_idx'],
                     'price': leave_s['end_price'],
@@ -965,7 +991,8 @@ def find_buy_sell_points(strokes, pivots, mdf: pd.DataFrame, orig_df: pd.DataFra
                 })
         else:
             new_high = leave_s['end_price'] > enter_s['end_price']
-            if new_high and pa_pos > 5 and pc_pos < pa_pos * 0.95:
+            if (new_high and _has_area(pa_pos) and _has_area(pc_pos)
+                    and pa_pos > 5 and pc_pos < pa_pos * 0.95):
                 dedup_append(sells, {
                     'type': '1S', 'idx': leave_s['end_idx'],
                     'price': leave_s['end_price'],
@@ -1032,6 +1059,88 @@ def find_buy_sell_points(strokes, pivots, mdf: pd.DataFrame, orig_df: pd.DataFra
                         'note': f'一卖后反抽已破 1S({s["price"]:.2f})，降级观察',
                         'stroke_i': si + 2,
                     })
+
+        # 日线主笔会过滤主笔内部的短回抽，导致真实的次级别二买/二卖漏检。
+        # 因此再直接基于原始 K 线补充“一买后的首次局部反弹 + 首次局部回抽”。
+        # 该逻辑只补二类点，不改变主笔和中枢的级别。
+        orig_highs = orig_df['high'].to_numpy(dtype=float)
+        orig_lows = orig_df['low'].to_numpy(dtype=float)
+        orig_idx_map = mdf['orig_idx'].to_numpy(dtype=int)
+        orig_n = len(orig_df)
+
+        def _signal_orig_idx(sig, is_buy):
+            """在信号所在合并 K 覆盖区间内，找出极值真正对应的原始交易日。"""
+            mi = int(sig['idx'])
+            end = int(orig_idx_map[mi])
+            start = int(orig_idx_map[mi - 1]) + 1 if mi > 0 else 0
+            start = max(0, min(start, end))
+            arr = orig_lows if is_buy else orig_highs
+            return start + int(np.nanargmin(np.abs(arr[start:end + 1] - float(sig['price']))))
+
+        def _to_mdf_idx(orig_i):
+            # 取覆盖该原始 K 的合并 K，而不是简单找“最近日期”。
+            return min(int(np.searchsorted(orig_idx_map, int(orig_i), side='left')),
+                       len(mdf) - 1)
+
+        # 二买：一买后先出现局部反弹高点，再出现首个已由后一根 K 确认的局部低点。
+        for b in base_1B:
+            b_orig = _signal_orig_idx(b, is_buy=True)
+            rebound_top = None
+            for k in range(b_orig + 1, orig_n - 1):
+                if (orig_highs[k] > orig_highs[k - 1]
+                        and orig_highs[k] >= orig_highs[k + 1]
+                        and orig_highs[k] > float(b['price']) * 1.01):
+                    rebound_top = k
+                    break
+            if rebound_top is None:
+                continue
+            for k in range(rebound_top + 1, orig_n - 1):
+                if (orig_lows[k] <= orig_lows[k - 1]
+                        and orig_lows[k] < orig_lows[k + 1]):
+                    is_valid = orig_lows[k] > float(b['price'])
+                    dedup_append(buys, {
+                        'type': '2B' if is_valid else '2B?',
+                        'idx': _to_mdf_idx(k),
+                        'orig_idx': int(k),
+                        'price': float(orig_lows[k]),
+                        'note': (f'一买后次级别首次回抽不破 1B({b["price"]:.2f})'
+                                 if is_valid else
+                                 f'一买后次级别回抽已破 1B({b["price"]:.2f})，降级观察'),
+                        'stroke_i': -1,
+                        'parent_1b_price': float(b['price']),
+                        'sublevel': True,
+                    })
+                    break
+
+        # 二卖：与二买完全对称。
+        for s in base_1S:
+            s_orig = _signal_orig_idx(s, is_buy=False)
+            rebound_bottom = None
+            for k in range(s_orig + 1, orig_n - 1):
+                if (orig_lows[k] < orig_lows[k - 1]
+                        and orig_lows[k] <= orig_lows[k + 1]
+                        and orig_lows[k] < float(s['price']) * 0.99):
+                    rebound_bottom = k
+                    break
+            if rebound_bottom is None:
+                continue
+            for k in range(rebound_bottom + 1, orig_n - 1):
+                if (orig_highs[k] >= orig_highs[k - 1]
+                        and orig_highs[k] > orig_highs[k + 1]):
+                    is_valid = orig_highs[k] < float(s['price'])
+                    dedup_append(sells, {
+                        'type': '2S' if is_valid else '2S?',
+                        'idx': _to_mdf_idx(k),
+                        'orig_idx': int(k),
+                        'price': float(orig_highs[k]),
+                        'note': (f'一卖后次级别首次反抽不破 1S({s["price"]:.2f})'
+                                 if is_valid else
+                                 f'一卖后次级别反抽已破 1S({s["price"]:.2f})，降级观察'),
+                        'stroke_i': -1,
+                        'parent_1s_price': float(s['price']),
+                        'sublevel': True,
+                    })
+                    break
     add_second_points()
 
     # ================================================================
@@ -1240,6 +1349,30 @@ def find_buy_sell_points(strokes, pivots, mdf: pd.DataFrame, orig_df: pd.DataFra
         return sorted(by_idx.values(), key=lambda x: x['idx'])
     buys = _reduce(buys)
     sells = _reduce(sells)
+
+    # 信号 idx 属于包含处理后的 mdf。一个合并 K 可能覆盖多个原始交易日，
+    # 不能直接用 mdf.orig_idx（合并末日）作为买卖点日期。应在该合并 K
+    # 覆盖的原始 K 区间内，按信号价格反查真正形成极值的交易日。
+    orig_idx_map = mdf['orig_idx'].values.astype(int)
+
+    def _attach_orig_idx(sig, is_buy):
+        mi = int(sig['idx'])
+        end = int(orig_idx_map[mi])
+        start = int(orig_idx_map[mi - 1]) + 1 if mi > 0 else 0
+        start = max(0, min(start, end))
+        values = orig_df['low' if is_buy else 'high'].iloc[start:end + 1].to_numpy(dtype=float)
+        if len(values) == 0:
+            sig['orig_idx'] = end
+            return
+        # 信号价格通常就是区间极值；使用最接近值可兼容浮点误差。
+        offset = int(np.nanargmin(np.abs(values - float(sig['price']))))
+        sig['orig_idx'] = start + offset
+
+    for b in buys:
+        _attach_orig_idx(b, is_buy=True)
+    for s in sells:
+        _attach_orig_idx(s, is_buy=False)
+
     return buys, sells
 
 
@@ -1297,8 +1430,9 @@ def detect_failed_signals(buys, sells, mdf, orig_df,
         if base != '1B':
             b.setdefault('failed', False)
             continue
-        # 信号 idx 是 mdf 索引，转换到原始K线后从下一根开始检测。
-        start_orig_idx = int(orig_idx_map[int(b['idx'])]) + 1
+        # 优先从信号真实形成日的下一根原始 K 开始检测；不能从合并 K
+        # 的末日开始，否则合并区间内已经发生的跌破会被跳过。
+        start_orig_idx = int(b.get('orig_idx', orig_idx_map[int(b['idx'])])) + 1
         limit = float(b['price']) - break_tolerance
         found = False
         for k in range(start_orig_idx, orig_n):
@@ -1314,7 +1448,7 @@ def detect_failed_signals(buys, sells, mdf, orig_df,
         if base != '1S':
             s.setdefault('failed', False)
             continue
-        start_orig_idx = int(orig_idx_map[int(s['idx'])]) + 1
+        start_orig_idx = int(s.get('orig_idx', orig_idx_map[int(s['idx'])])) + 1
         limit = float(s['price']) + break_tolerance
         found = False
         for k in range(start_orig_idx, orig_n):
@@ -2097,7 +2231,8 @@ def interpret_market(orig_df, mdf, strokes, pivots, buys, sells,
         latest = formal[-1] if formal else all_pts[-1]
         p, side = latest
         try:
-            sig_date = _fmt_ts(orig_df.iloc[mdf['orig_idx'].values[p['idx']]]['time_key'], style='full')
+            sig_orig_idx = int(p.get('orig_idx', mdf['orig_idx'].values[p['idx']]))
+            sig_date = _fmt_ts(orig_df.iloc[sig_orig_idx]['time_key'], style='full')
         except Exception:
             sig_date = '?'
         lines.append(f'· 最近信号: {p["type"]} @ {sig_date}  {p["price"]:.2f}   {p["note"]}')
@@ -2153,8 +2288,8 @@ def interpret_market(orig_df, mdf, strokes, pivots, buys, sells,
     # 只对"最近的失败"进行告警，避免历史失败满屏
     def _sig_date(sig):
         try:
-            return _fmt_ts(orig_df.iloc[mdf['orig_idx'].values[sig['idx']]]['time_key'],
-                           style='short')
+            oi = int(sig.get('orig_idx', mdf['orig_idx'].values[sig['idx']]))
+            return _fmt_ts(orig_df.iloc[oi]['time_key'], style='short')
         except Exception:
             return '?'
     if failed_1b:
@@ -2188,7 +2323,7 @@ def interpret_market(orig_df, mdf, strokes, pivots, buys, sells,
     # 撤销信号：也按展示区间过滤（用信号自身的 idx 对应的 time_key）
     def _sig_ts(sig):
         try:
-            oi = mdf['orig_idx'].values[sig['idx']]
+            oi = int(sig.get('orig_idx', mdf['orig_idx'].values[sig['idx']]))
             return orig_df.iloc[oi]['time_key']
         except Exception:
             return None
@@ -2731,7 +2866,7 @@ def plot_chan(orig_df, mdf, fractals, strokes, segments, pivots, buys, sells,
     for b in buys:
         if not _plot_visible(b):
             continue
-        xi = orig_idx_map[b['idx']]
+        xi = int(b.get('orig_idx', orig_idx_map[b['idx']]))
         m, cc, sz = marker_map_buy[b['type']]
         a = _alpha(b['type'])
         failed = bool(b.get('failed'))
@@ -2761,7 +2896,7 @@ def plot_chan(orig_df, mdf, fractals, strokes, segments, pivots, buys, sells,
     for s in sells:
         if not _plot_visible(s):
             continue
-        xi = orig_idx_map[s['idx']]
+        xi = int(s.get('orig_idx', orig_idx_map[s['idx']]))
         m, cc, sz = marker_map_sell[s['type']]
         a = _alpha(s['type'])
         failed = bool(s.get('failed'))
@@ -2979,11 +3114,11 @@ def main():
     parser.add_argument('--txt', default='长文本-1790229713.txt',
                         help='本地 txt 数据文件路径（source=txt 时使用）')
     parser.add_argument('--stock', 
-                        default='HK.09660',
+                        default='HK.800700',
                         # default='SH.603986',
                         help='股票/指数代码（source=futu 时使用）')
-    parser.add_argument('--start', default='2025-08-01')
-    parser.add_argument('--end',   default='2026-10-24')
+    parser.add_argument('--start', default='2026-03-01')
+    parser.add_argument('--end',   default='2026-10-19')
     parser.add_argument('--ktype',
                         choices=['K_DAY', 'K_60M', 'K_120M', 'K_240M',
                                  'K_WEEK', 'K_MON'],
@@ -3095,7 +3230,8 @@ def main():
               f"  破位反抽 {n_rb}")
 
     for b in buys:
-        d = orig_df.loc[mdf['orig_idx'].values[b['idx']], 'time_key'].strftime('%Y-%m-%d')
+        oi = int(b.get('orig_idx', mdf['orig_idx'].values[b['idx']]))
+        d = orig_df.loc[oi, 'time_key'].strftime('%Y-%m-%d')
         tag = ''
         if b.get('failed'):
             p = b.get('failed_price')
@@ -3105,7 +3241,8 @@ def main():
             tag = '  ⊘ 已撤销(前置 1B 失败)'
         print(f"  {b['type']} {d} @ {b['price']:.2f}  {b['note']}{tag}")
     for s in sells:
-        d = orig_df.loc[mdf['orig_idx'].values[s['idx']], 'time_key'].strftime('%Y-%m-%d')
+        oi = int(s.get('orig_idx', mdf['orig_idx'].values[s['idx']]))
+        d = orig_df.loc[oi, 'time_key'].strftime('%Y-%m-%d')
         tag = ''
         if s.get('failed'):
             p = s.get('failed_price')
